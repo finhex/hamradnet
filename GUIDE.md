@@ -79,7 +79,8 @@ cd hamradnet
 ```
 
 You also need [Go](https://go.dev/dl/) 1.24 or newer to build the Go server, or
-[Rust](https://rustup.rs) to build the Rust one.
+[Rust](https://rustup.rs) 1.95 or newer to build the Rust one. See [Build
+tools](README.md#build-tools) for everything the full builds use.
 
 Then run one command, with your server's IP:
 

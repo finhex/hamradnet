@@ -456,17 +456,54 @@ were on your LAN — treat it like letting someone into your house's wifi.
 Each puts the Linux programs, the Windows programs with `wintun.dll`, and a
 ready-to-send Windows zip under its own folder in `dist/`.
 
-Go needs Go 1.24+, Rust needs Rust 1.75+. The apps also want
-[Zig](https://ziglang.org/download/) (and, for Rust, `cargo install
-cargo-zigbuild`). With it, they are linked against glibc 2.28 and run on any
-Linux from 2018 on; without it, they only run on systems as new as the one that
-built them, and the build says so. Both Windows builds need mingw, and Rust
-also needs its Windows and static-Linux targets:
+### Build tools
+
+| Tool | What it is for | Minimum | Used for v0.4.0 |
+|---|---|---|---|
+| [Go](https://go.dev/dl/) | every Go program | 1.24 (`go.mod`) | 1.27.3 |
+| [Rust](https://rustup.rs), via rustup | every Rust program | 1.95 (egui 0.36 needs it) | 1.96.0 |
+| [Zig](https://ziglang.org/download/) | Linux apps that run on old distros | not pinned | 0.17.0 |
+| [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) | the same, for the Rust app | not pinned | 0.24.0 |
+| mingw-w64 GCC | the Windows builds | not pinned | 16.2.0 |
+| wintun.dll | the Windows network adapter; downloaded by the build | 0.14.1 (pinned in `scripts/common.sh`) | 0.14.1 |
+
+"Not pinned" means only the version in the last column has been tried.
+
+Rust also needs these targets: `x86_64-unknown-linux-musl` for the static
+server and command line, `x86_64-pc-windows-gnu` for Windows, and
+`aarch64-unknown-linux-musl` only when `deploy-vps.sh --rust` meets an ARM
+server (it adds that one itself).
+
+**Zig is optional but recommended.** With it, both Linux apps are linked
+against glibc 2.28 and run on any Linux from 2018 on. Without it, they only run
+on systems at least as new as the one that built them, and the build says so.
+
+On Arch, CachyOS or Manjaro:
 
 ```bash
-sudo pacman -S mingw-w64-gcc      # or: apt install mingw-w64
-rustup target add x86_64-pc-windows-gnu x86_64-unknown-linux-musl
+sudo pacman -S go rustup zig mingw-w64-gcc
+rustup default stable
+rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu
+cargo install --locked cargo-zigbuild
 ```
+
+On Debian or Ubuntu, Go and Zig are best taken from their websites, as the
+distro's packages are often older than the minimums above:
+
+```bash
+sudo apt install build-essential gcc-mingw-w64-x86-64 libgl1-mesa-dev xorg-dev
+curl https://sh.rustup.rs -sSf | sh
+rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu
+cargo install --locked cargo-zigbuild
+```
+
+The releases are built on CachyOS. The Debian/Ubuntu package list has not been
+tried for a full build.
+
+The libraries the code depends on are pinned in `go/go.sum` and
+`rust/Cargo.lock`. The main ones are Fyne 2.8.1 for the Go app, eframe/egui
+0.36.2 for the Rust app, wireguard-go's `tun` package and the wintun crate
+0.5.1 for the network adapter, snow 0.9.6 for Noise in Rust, and tokio 1.53.
 
 ## Testing
 
