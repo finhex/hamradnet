@@ -17,8 +17,9 @@
 # names a socket that is not there, so it is unset rather than faked.
 set -euo pipefail
 
-cd "$(dirname "$0")"
 BINARY="${1:-}"
+[[ -z "$BINARY" ]] || BINARY="$(realpath "$BINARY")"
+cd "$(dirname "$0")"
 if [[ -z "$BINARY" ]]; then
   for candidate in ./hamradnet-gui ../dist/go/linux/hamradnet-gui ../dist/rust/linux/hamradnet-gui; do
     [[ -x "$candidate" ]] && BINARY="$candidate" && break
@@ -29,14 +30,23 @@ if [[ ! -x "$BINARY" ]]; then
   exit 1
 fi
 
+BINARY="$(realpath "$BINARY")"
 X11_ONLY=(-u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR XDG_SESSION_TYPE=x11)
+SCREEN=(DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}")
 
 if [[ $EUID -eq 0 ]]; then
   exec env "${X11_ONLY[@]}" "$BINARY"
 fi
 
 echo "Starting HamRadNet (it needs root to create the network interface)..."
-exec sudo -E env "${X11_ONLY[@]}" \
-  DISPLAY="${DISPLAY:-:0}" \
-  XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
-  "$BINARY"
+if command -v sudo > /dev/null; then
+  exec sudo -E env "${X11_ONLY[@]}" "${SCREEN[@]}" "$BINARY"
+elif command -v pkexec > /dev/null; then
+  # Systems installed without sudo, such as Debian given a root password, still
+  # have pkexec, which asks in a window. It starts the program with a clean
+  # environment, so the screen settings are passed explicitly.
+  exec pkexec "$(command -v env)" "${X11_ONLY[@]}" "${SCREEN[@]}" "$BINARY"
+else
+  echo "Neither sudo nor pkexec is installed. Start it as root instead: su -c '$0'" >&2
+  exit 1
+fi

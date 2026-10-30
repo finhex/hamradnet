@@ -5,6 +5,7 @@ setting up a server, starting the app, and getting games to find each other.
 The [README](README.md) is the reference; this is the walkthrough.
 
 - [The pieces](#the-pieces)
+- [What it runs on](#what-it-runs-on)
 - [1. Set up a server from nothing](#1-set-up-a-server-from-nothing)
 - [2. Start the app](#2-start-the-app)
 - [3. Play together](#3-play-together)
@@ -29,6 +30,30 @@ player plays with a Rust player. Pick either. If one gives you trouble on your
 machine, try the other.
 
 Your group needs **one server**. Every player needs **the app**.
+
+## What it runs on
+
+| Program | Runs on |
+|---|---|
+| **The app, Linux** | any 64-bit PC distro from about 2018 on: Ubuntu 20.04 and newer, Debian 10+, Linux Mint 20+, Fedora, Arch, Manjaro, CachyOS, openSUSE, Rocky/Alma/RHEL 8+ |
+| **The app, Windows** | Windows 10 and 11, 64-bit |
+| **The command line** | any 64-bit Linux at all, and Windows 10 and 11 |
+| **The server** | any Linux with systemd, on a 64-bit PC or ARM processor |
+
+Both Linux apps, Go and Rust, were tested on Debian 11 from 2021 and on
+CachyOS from 2026.
+
+The Linux app needs an ordinary desktop (KDE, GNOME, Xfce, Cinnamon, ...),
+which already includes everything it uses, plus `sudo` or `pkexec` to ask for
+your password. On a stripped-down system, the app names any library it cannot
+find. On Debian or Ubuntu, this installs them all:
+
+```bash
+sudo apt install libgl1 libegl1 libx11-6 libxcursor1 libxrandr2 libxinerama1 \
+    libxi6 libxxf86vm1 libxkbcommon-x11-0
+```
+
+Not built yet: the app for macOS, and for ARM computers such as a Raspberry Pi.
 
 ## 1. Set up a server from nothing
 
@@ -124,17 +149,17 @@ From the cloned folder, that is `dist/go/linux/run-gui.sh` or
 
 **Why it asks for your password:** the app creates a network adapter
 (`hamrad0`), and Linux only lets administrators do that. The launcher asks
-`sudo` for permission.
+`sudo` for permission, or, on a system without `sudo`, shows a password window
+through `pkexec`.
 
 **Why it sometimes does not ask:** `sudo` remembers your password for a few
 minutes (five by default) in the same terminal. If you used `sudo` recently, it
 does not ask again. That is normal. To make it ask every time, run `sudo -k`
 first.
 
-**Why not just `sudo hamradnet-gui`:** `sudo` hides your screen from the app,
-and on a Wayland desktop the Go app then crashes while loading your icon theme.
-The launcher passes your screen through and draws the window via XWayland, so
-it works and looks the same.
+**Why not just `sudo hamradnet-gui`:** `sudo` hides your screen from the app.
+The launcher passes your screen through and draws the window via X11 (XWayland
+on a Wayland desktop), so it works and looks the same.
 
 ### Windows
 
@@ -186,69 +211,56 @@ player's `10.66.x.x` address from the app, for example in Minecraft's Direct
 Connect or a shooter's "connect to IP".
 
 **2. The game lists LAN games by itself.** The game shouts "anyone hosting?"
-to the whole network, which is called a *broadcast*. HamRadNet copies every
-broadcast that enters the tunnel to all players. The question is whether your
-computer sends the broadcast into the tunnel at all:
+to the whole network, which is called a *broadcast*. HamRadNet sends every
+broadcast to all players, **with no setup**:
 
 | How the game shouts | Works? |
 |---|---|
+| to `255.255.255.255`: **Warcraft III** and many games from around 2000-2010 | yes, by itself (see below) |
 | to the tunnel's own network (`10.66.255.255`) | yes |
 | multicast, used by some newer games | usually; it depends on the system |
-| to `255.255.255.255`: **Warcraft III** and many games from around 2000-2010 | **after one setting** (below) |
 
-The last row needs a setting because a broadcast to `255.255.255.255` leaves
-your PC through **one** network adapter only, normally your real one, so it
-never enters the tunnel. Hamachi and Radmin VPN users hit the same problem.
-Here is how to fix it on each system.
+The first row needed special care, because your computer sends a broadcast to
+`255.255.255.255` out of **one** network adapter only, normally your real one,
+so it would never enter the tunnel. Hamachi and Radmin VPN users hit exactly
+this. HamRadNet handles it by itself:
+
+- **Linux:** the app notices broadcasts leaving through your other adapters,
+  and also sends a copy through the tunnel, from your `10.66.x.x` address so
+  that answers come back the same way. The original still reaches your home
+  network, so nothing there changes. Broadcasts from services that announce
+  your PC itself stay at home: DHCP, Windows file sharing, KDE Connect,
+  Syncthing and Steam's streaming discovery.
+- **Windows:** the app makes `hamrad0` the adapter Windows prefers for
+  broadcasts while it runs. That is the fix Hamachi and Radmin VPN users apply
+  by hand. Broadcasts then go to your friends instead of your home network
+  until you close the app.
+
+The Linux side is tested between every pairing of Go and Rust apps and
+servers. The Windows side has not been tested on Windows yet.
 
 ### Warcraft III
 
-Everyone must run **the same game version**.
+1. Everyone runs **the same game version**.
+2. Everyone starts HamRadNet and joins the same network.
+3. One player creates a LAN game; the others see it in their LAN list.
 
-**Linux players** (including Warcraft III under Wine or Proton): after
-HamRadNet has started, run
+If the list stays empty, open **Log** in the app and check for a line saying
+it cannot copy LAN broadcasts. Then see [When something does not
+work](#when-something-does-not-work).
 
-```bash
-sudo ./scripts/lan-broadcast.sh up      # sends WC3's broadcasts (UDP 6112) into the tunnel
-sudo ./scripts/lan-broadcast.sh down    # when you are done, back to normal
-```
+Windows usually files the HamRadNet adapter under **public** networks. When
+Windows Firewall asks about Warcraft III, tick **both Private and Public**.
+Otherwise other players can see your game but cannot join it.
 
-Only Warcraft III's port goes into the tunnel; everything else on your PC
-keeps broadcasting to your home network as usual. The setting is forgotten at
-reboot.
+### Any other game
 
-**Windows players**, in an **Administrator PowerShell** while HamRadNet runs:
+Most games work the same way as Warcraft III. If one does not:
 
-```powershell
-# Windows sends 255.255.255.255 broadcasts out of the adapter with the lowest
-# metric. Making it HamRadNet's lets the game list find your friends.
-Set-NetIPInterface -InterfaceAlias hamrad0 -InterfaceMetric 1
-
-# To undo it:
-Set-NetIPInterface -InterfaceAlias hamrad0 -AutomaticMetric Enabled
-```
-
-This is the standard fix for Hamachi and Radmin VPN. The Linux side above was
-tested with HamRadNet; this Windows command has not been tested with
-HamRadNet's adapter yet.
-
-Windows also usually files the HamRadNet adapter under **public** networks.
-When Windows Firewall asks about Warcraft III, tick **both Private and
-Public**. Otherwise other players can see your game but cannot join it.
-
-### Any other game whose LAN list stays empty
-
-1. Make sure you can reach the other player: `ping 10.66.x.x` (their address).
-2. Find which UDP port the game uses for LAN discovery. Searching "*game name*
-   LAN port" usually finds it.
-3. On Linux, give the script that port; you can list several, and ranges work:
-
-   ```bash
-   sudo ./scripts/lan-broadcast.sh up 6112 27015-27020
-   ```
-
-   On Windows, the metric setting above already covers every port.
-4. If the game also has a "join by IP" option, that always works.
+1. Check that you can reach the other player: `ping 10.66.x.x` (their address).
+2. If the game has a "join by IP" option, use their `10.66.x.x` address. That
+   always works.
+3. Check the host's firewall (see above).
 
 ### What cannot work
 
@@ -263,7 +275,12 @@ For Minecraft step by step, see the [README](README.md#playing-minecraft).
 
 ## When something does not work
 
-Go down this list in order:
+**Start with the log.** Click **Log** in the app (top right, or next to
+**Connect**). It shows what the app has been doing; **Copy all** puts it on
+the clipboard, ready to paste into a chat or a GitHub issue for whoever is
+helping you.
+
+Then go down this list in order:
 
 1. **The app stays on "Connecting…".** Check the server address (**Change
    server**), then test it from any PC:

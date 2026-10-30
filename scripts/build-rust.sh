@@ -14,6 +14,7 @@ DIST=dist/rust
 TARGET_DIR=rust/target
 LINUX_TARGET=x86_64-unknown-linux-musl
 WINDOWS_TARGET=x86_64-pc-windows-gnu
+GLIBC=2.28
 
 rm -rf "$DIST"
 mkdir -p "$DIST/linux" "$DIST/windows"
@@ -34,10 +35,21 @@ cp "$TARGET_DIR/$LINUX_TARGET/release/hamradnet" "$DIST/linux/"
 cp "$TARGET_DIR/$LINUX_TARGET/release/hamradnet-server" "$DIST/linux/"
 
 # The GUI links against system graphics libraries, so it is built against glibc
-# rather than musl - a static binary cannot dlopen the GPU drivers it needs.
+# rather than musl - a static binary cannot dlopen the GPU drivers it needs. A
+# normal build then only runs on systems whose glibc is at least as new as this
+# one's; cargo-zigbuild links it against an old glibc instead, so it runs on any
+# distro from 2018 on.
 echo "==> Rust, Linux: the app"
-( cd rust && cargo build --release -p hamradnet-gui )
-cp "$TARGET_DIR/release/hamradnet-gui" "$DIST/linux/"
+if command -v zig > /dev/null && command -v cargo-zigbuild > /dev/null; then
+  echo "    for glibc $GLIBC and newer, with zig"
+  ( cd rust && cargo zigbuild --release --target "x86_64-unknown-linux-gnu.$GLIBC" -p hamradnet-gui )
+  cp "$TARGET_DIR/x86_64-unknown-linux-gnu/release/hamradnet-gui" "$DIST/linux/"
+else
+  echo "!! zig or cargo-zigbuild not found: the app will need glibc $(ldd --version | awk 'NR==1{print $NF}') or newer." >&2
+  echo "   Install zig (ziglang.org) and \`cargo install cargo-zigbuild\` for one that runs on older distros." >&2
+  ( cd rust && cargo build --release -p hamradnet-gui )
+  cp "$TARGET_DIR/release/hamradnet-gui" "$DIST/linux/"
+fi
 install -m 0755 scripts/run-gui.sh "$DIST/linux/run-gui.sh"
 
 echo "==> Rust, Windows: server, command line and the app"

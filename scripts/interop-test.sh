@@ -6,7 +6,8 @@
 # directly and once with them forced through the server's relay. Every run
 # starts the real binaries, creates a network on the first client, joins it from
 # the second, then sends pings and a few megabytes of TCP across the tunnel in
-# both directions.
+# both directions, and finally runs a Warcraft III-style LAN search to
+# 255.255.255.255, which must find the other player with no setup at all.
 #
 # The first client to connect gets the lower peer ID, and the lower ID starts
 # the encrypted handshake, so Go+Rust and Rust+Go between them cover each
@@ -20,6 +21,7 @@
 #
 #   ./scripts/interop-test.sh             tests dist/go/linux and dist/rust/linux
 #   GO_BIN=dir RUST_BIN=dir ./scripts/interop-test.sh
+#   ONLY="go rust go *" ./scripts/interop-test.sh     one server and pairing
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -168,6 +170,47 @@ transfer() {
   echo "$rate"
 }
 
+# A game's LAN search, the way Warcraft III does it: from port 6112 to
+# 255.255.255.255:6112, waiting for the host's answer. That broadcast leaves
+# through eth0, not the tunnel, so it only reaches B if the client copies it in.
+SEARCH='import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.bind(("0.0.0.0", 6112)); s.settimeout(5)
+s.sendto(b"searchgame", ("255.255.255.255", 6112))
+try:
+    while True:
+        data, src = s.recvfrom(1500)
+        if data == b"gameinfo":
+            print(src[0]); break
+except socket.timeout:
+    print("no answer")'
+# A game hosting: answers the first search it hears, straight back to the sender.
+HOST='import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 6112)); s.settimeout(8)
+try:
+    while True:
+        data, src = s.recvfrom(1500)
+        if data == b"searchgame":
+            s.sendto(b"gameinfo", src); break
+except socket.timeout:
+    pass'
+
+# discover <searcher ns> <host ns> <host address>: succeeds if the search found
+# the host through the tunnel.
+discover() {
+  in_ns "$2" python3 -I -c "$HOST" &
+  local host=$!
+  sleep 0.3
+  local answer
+  answer="$(in_ns "$1" python3 -I -c "$SEARCH")"
+  wait "$host" 2> /dev/null || true
+  [[ "$answer" == "$3" ]]
+}
+
 FAILED=0
 RESULTS=()
 
@@ -238,12 +281,22 @@ run_case() {
       result=FAIL detail="TCP from A to B did not arrive intact"
     elif ! rate_ba="$(transfer "$NS_B" "$NS_A" "$addr_a")"; then
       result=FAIL detail="TCP from B to A did not arrive intact"
+    elif ! discover "$NS_A" "$NS_B" "$addr_b"; then
+      result=FAIL detail="a game's LAN search (255.255.255.255:6112) from A never found B"
     fi
   fi
 
   if [[ -z $result ]]; then
-    cli "$NS_A" "$a" "$name_a" peers > "$RUN/peers.out" 2>&1 || true
-    path_seen="$(grep -F "$name_b" "$RUN/peers.out" | grep -oE '\b(direct|relay)\b' | head -1)"
+    # A link may come up through the relay first, when the relay answers the
+    # handshake before the direct path does, and switch to direct once the
+    # client's next probe gets through. Probes go out when the link has been
+    # quiet for a few seconds, so give that time rather than looking once.
+    for _ in $(seq 1 40); do
+      cli "$NS_A" "$a" "$name_a" peers > "$RUN/peers.out" 2>&1 || true
+      path_seen="$(grep -F "$name_b" "$RUN/peers.out" | grep -oE '\b(direct|relay)\b' | head -1)"
+      [[ "$path_seen" == "$path" ]] && break
+      sleep 0.5
+    done
     cli "$NS_A" "$(other "$a")" "$name_a" status > "$RUN/status-other.out" 2>&1 || true
     cli "$NS_A" "$(other "$a")" "$name_a" peers > "$RUN/peers-other.out" 2>&1 || true
     if [[ "$path_seen" != "$path" ]]; then
@@ -254,7 +307,7 @@ run_case() {
       result=FAIL detail="the $(other "$a") CLI could not list A's peers: $(tr '\n' ' ' < "$RUN/peers-other.out")"
     else
       result=PASS
-      detail="ping ${rtt} ms, ${loss}% loss; TCP A→B ${rate_ab} MB/s, B→A ${rate_ba} MB/s"
+      detail="ping ${rtt} ms, ${loss}% loss; TCP A→B ${rate_ab} MB/s, B→A ${rate_ba} MB/s; LAN search found B"
     fi
   fi
 
@@ -277,9 +330,14 @@ echo "Go:   $GO_BIN ($("$GO_BIN/hamradnet-server" --version))"
 echo "Rust: $RUST_BIN ($("$RUST_BIN/hamradnet-server" --version))"
 echo
 echo "  server client A+B  path    result"
+RAN=0
 for server in go rust; do
   for pair in "go go" "rust rust" "go rust" "rust go"; do
     for path in direct relay; do
+      # ONLY="go rust go direct" runs just that combination; wildcards work.
+      # shellcheck disable=SC2053
+      [[ -z "${ONLY:-}" || "$server $pair $path" == $ONLY ]] || continue
+      RAN=$((RAN + 1))
       # shellcheck disable=SC2086
       run_case "$server" $pair "$path"
     done
@@ -288,8 +346,8 @@ done
 
 echo
 if [[ $FAILED == 0 ]]; then
-  echo "All 16 combinations work."
+  echo "All $RAN combinations work."
 else
-  echo "$FAILED of 16 combinations failed."
+  echo "$FAILED of $RAN combinations failed."
   exit 1
 fi

@@ -93,8 +93,8 @@ which one is running:
 
 ```bash
 ssh root@203.0.113.45 hamradnet-server --version
-#   hamradnet-server 0.2.0-go   → Go
-#   hamradnet-server 0.1.0      → Rust
+#   hamradnet-server 0.3.0-go   → Go (the Go version always ends in -go)
+#   hamradnet-server 0.3.0      → Rust
 ```
 
 **An IP address is all you need** — no domain name, no DNS, no certificates.
@@ -172,9 +172,12 @@ dist/rust/linux/run-gui.sh     # the Rust app
 ```
 
 Not `sudo hamradnet-gui`. `sudo` drops the settings that let the app reach
-your screen, and on a Wayland desktop the Go app's window toolkit then crashes
-while loading your icon theme as root. The launcher asks for your password,
-keeps the display, and draws the window through XWayland, which looks the same.
+your screen. The launcher asks for your password (through `sudo`, or `pkexec`
+where there is no `sudo`), keeps the display, and draws the window through X11,
+or XWayland on a Wayland desktop, which looks the same.
+
+The apps run on any 64-bit Linux from about 2018 on (glibc 2.28 or newer); both
+were tested on Debian 11. See [What it runs on](GUIDE.md#what-it-runs-on).
 
 ### First run
 
@@ -249,14 +252,15 @@ if a direct path cannot be made.
 
 **Everything looks connected but the game cannot see anyone.** Test the tunnel
 itself first — `ping 10.66.0.2` (their address from the list) should reply. If
-the ping works and the game's LAN list stays empty, the game is probably
-announcing itself to `255.255.255.255`, which your system sends out of your real
-network card rather than the tunnel. Warcraft III does this. On Linux,
-`sudo ./scripts/lan-broadcast.sh up` fixes it; [GUIDE.md](GUIDE.md#games)
-covers Windows and other games. If the list fills but joining fails, it is the
-host's firewall: on Windows, allow the game through Windows Defender Firewall
-for both private and public networks, since Windows usually files the HamRadNet
-adapter under public.
+the ping works and the game's LAN list stays empty, open **Log** in the app and
+look for a line about LAN broadcasts; [GUIDE.md](GUIDE.md#games) explains how
+games are found. If the list fills but joining fails, it is the host's firewall:
+on Windows, allow the game through Windows Defender Firewall for both private
+and public networks, since Windows usually files the HamRadNet adapter under
+public.
+
+**Anything else.** Click **Log** in the app. **Copy all** puts the whole log on
+the clipboard, ready to paste wherever you are asking for help.
 
 ## The command line, if you prefer
 
@@ -385,10 +389,16 @@ pair uses the relay and keeps probing in the background.
 enters the tunnel addressed to a broadcast or multicast address is copied to
 every peer in the network, the way a real switch floods one. The catch is
 getting it into the tunnel. A broadcast to the tunnel's own subnet,
-`10.66.255.255`, always goes in. A broadcast to `255.255.255.255` goes out of a
-single interface chosen by the operating system, normally your real network
-card. `scripts/lan-broadcast.sh` steers it into the tunnel on Linux, and an
-interface metric does the same on Windows; see [GUIDE.md](GUIDE.md#games).
+`10.66.255.255`, always goes in. A broadcast to `255.255.255.255`, which is how
+Warcraft III and many other games search, goes out of a single interface chosen
+by the operating system, normally the real network card. So on Linux the client
+watches, with a packet socket and an in-kernel filter, for UDP broadcasts
+leaving through other interfaces. It sends a copy into the tunnel from its
+tunnel address, and the original still reaches the local network. A short list
+of ports belonging to services that announce the computer itself (DHCP,
+NetBIOS, KDE Connect, Syncthing, Steam streaming) is left out. On Windows the
+client instead gives the tunnel adapter the lowest interface metric, which makes
+it the one Windows sends such broadcasts through.
 
 ## Security
 
@@ -419,8 +429,12 @@ were on your LAN — treat it like letting someone into your house's wifi.
 Each puts the Linux programs, the Windows programs with `wintun.dll`, and a
 ready-to-send Windows zip under its own folder in `dist/`.
 
-Go needs Go 1.24+, Rust needs Rust 1.75+. Both Windows builds need mingw, and
-Rust also needs its Windows and static-Linux targets:
+Go needs Go 1.24+, Rust needs Rust 1.75+. The apps also want
+[Zig](https://ziglang.org/download/) (and, for Rust, `cargo install
+cargo-zigbuild`). With it, they are linked against glibc 2.28 and run on any
+Linux from 2018 on; without it, they only run on systems as new as the one that
+built them, and the build says so. Both Windows builds need mingw, and Rust
+also needs its Windows and static-Linux targets:
 
 ```bash
 sudo pacman -S mingw-w64-gcc      # or: apt install mingw-w64
@@ -440,9 +454,14 @@ built programs in `dist/` and runs each server, Go and Rust, against each
 pairing of clients: Go+Go, Rust+Rust, Go+Rust and Rust+Go. Each pairing runs
 once with a direct path and once forced through the relay, so 16 runs in all.
 Each run creates a network, joins it, then sends full-size pings and 4 MB of TCP
-across the tunnel in both directions. It needs no root and changes nothing on
-your machine: it runs in a throwaway network namespace, the kernel feature
-containers use, without Docker or any other container runtime.
+across the tunnel in both directions. Last, it runs a Warcraft III-style LAN
+search to `255.255.255.255`, which must find the other player with no setup.
+The network is created and joined with the *other* language's command line,
+which proves either one controls either app. It needs no root and changes
+nothing on your machine: it runs in a throwaway network namespace, the kernel
+feature containers use, without Docker or any other container runtime.
+`ONLY="go rust go *" ./scripts/interop-test.sh` runs a single server and
+pairing.
 
 Two narrower checks run the same way across languages:
 
@@ -473,7 +492,7 @@ rust/                  the Rust version (a Cargo workspace)
   crates/gui           the desktop app
 deploy/                systemd units, shared by both versions
 scripts/               build-*.sh, deploy-vps.sh, install-server.sh,
-                       run-gui.sh, lan-broadcast.sh, interop-test.sh
+                       run-gui.sh, interop-test.sh
 dist/go/, dist/rust/   built programs (made by the build scripts)
 ```
 

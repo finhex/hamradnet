@@ -11,6 +11,33 @@ use anyhow::{bail, Context, Result};
 
 use super::{netmask_from_prefix, TunConfig};
 
+/// Windows sends a 255.255.255.255 broadcast out of the interface with the
+/// lowest metric only, so making that the tunnel lets games that announce
+/// themselves that way reach the other players. It is the fix Hamachi and
+/// Radmin VPN users are told to apply by hand. Everything else works without
+/// it, so a failure is only reported.
+fn prefer_for_broadcasts(name: &str) {
+    use std::os::windows::process::CommandExt;
+    // Keeps a console window from flashing up behind the app.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let result = std::process::Command::new("netsh")
+        .args(["interface", "ipv4", "set", "interface", &format!("interface={name}"), "metric=1"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::warn!(
+            output = %String::from_utf8_lossy(&output.stdout).trim(),
+            "could not make the tunnel the preferred interface for LAN broadcasts"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not make the tunnel the preferred interface for LAN broadcasts"
+        ),
+    }
+}
+
 pub struct Device {
     session: Arc<wintun::Session>,
     // The adapter must outlive the session; dropping it tears down the interface.
@@ -40,6 +67,7 @@ impl Device {
 
         let device = Self { session: Arc::new(session), _adapter: adapter };
         device.set_address(config.address, config.prefix_len)?;
+        prefer_for_broadcasts(&config.name);
         Ok(device)
     }
 

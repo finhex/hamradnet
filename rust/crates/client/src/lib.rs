@@ -1,5 +1,6 @@
 //! HamRadNet client library: the pieces the `hamradnet` binary is assembled from.
 
+pub mod broadcast;
 pub mod check;
 pub mod config;
 pub mod daemon;

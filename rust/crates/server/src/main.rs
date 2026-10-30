@@ -9,6 +9,7 @@ mod control;
 mod relay;
 mod state;
 
+use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -56,11 +57,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Colour only for a terminal: under systemd it would land in the journal as
+    // escape codes.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "hamradnet_server=info".into()),
         )
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let args = Args::parse();

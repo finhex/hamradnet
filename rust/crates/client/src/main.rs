@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use hamradnet::config::{default_config_path, encode_key, ipc_path, Config};
@@ -113,11 +114,14 @@ async fn run_daemon(
     name: Option<String>,
     port: u16,
 ) -> Result<()> {
+    // Colour only for a terminal: under systemd or in a file it would land as
+    // escape codes.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "hamradnet=info".into()),
         )
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let config = match Config::load(&config_path) {

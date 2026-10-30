@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "hamradnet"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "hamradnet-gui"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "hamradnet-proto"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "rand",
@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "hamradnet-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",

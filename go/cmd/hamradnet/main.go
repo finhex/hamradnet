@@ -19,7 +19,7 @@ import (
 	"github.com/finhex/hamradnet/internal/client"
 )
 
-var version = "0.1.0"
+var version = "0.3.0-go"
 
 func main() {
 	if len(os.Args) < 2 {

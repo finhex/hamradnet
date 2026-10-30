@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"runtime"
@@ -31,11 +32,15 @@ import (
 // refresh is how often the window redraws, so peer state looks live.
 const refresh = time.Second
 
-var version = "0.2.0-go"
+var version = "0.3.0-go"
 
 type ui struct {
 	window fyne.Window
 	log    *slog.Logger
+	// logs holds recent log lines for the log window; logWindow is that window
+	// while it is open.
+	logs      *logBuffer
+	logWindow fyne.Window
 
 	mu         sync.Mutex
 	daemon     *client.Daemon
@@ -70,8 +75,8 @@ This is almost always `+"`sudo`"+` stripping the display settings.
 
 or, by hand:
 
-    sudo -E env DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY \
-        XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR hamradnet-gui
+    sudo -E env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
+        DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY hamradnet-gui
 
 The app needs root to create the network interface, but it also needs your
 session's display to draw the window.
@@ -79,16 +84,24 @@ session's display to draw the window.
 		os.Exit(1)
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Everything logged goes to the terminal as before, and is also kept for the
+	// app's own log window.
+	logs := &logBuffer{}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs),
+		&slog.HandlerOptions{Level: slog.LevelInfo}))
+	log.Info("starting HamRadNet", "version", version, "os", runtime.GOOS)
 
 	application := app.NewWithID("net.hamradnet.app")
 	window := application.NewWindow("HamRadNet")
 	window.Resize(fyne.NewSize(920, 640))
 
-	u := &ui{window: window, log: log, configPath: client.DefaultConfigPath()}
+	u := &ui{window: window, log: log, logs: logs, configPath: client.DefaultConfigPath()}
 	u.build()
 	window.SetCloseIntercept(func() {
 		u.shutdown()
+		if u.logWindow != nil {
+			u.logWindow.Close()
+		}
 		window.Close()
 	})
 	window.ShowAndRun()
@@ -152,7 +165,8 @@ func (u *ui) showSetup() {
 	items = append(items,
 		form,
 		widget.NewLabel("Just the IP of your server. Port 7777 is assumed."),
-		container.NewCenter(connect),
+		container.NewCenter(container.NewHBox(connect,
+			widget.NewButton("Log", func() { u.showLogs() }))),
 		u.setupError,
 	)
 
@@ -165,7 +179,10 @@ func (u *ui) showSetup() {
 func (u *ui) showMain() {
 	header := container.NewBorder(nil, nil,
 		container.NewHBox(u.statusLabel, u.addressText),
-		widget.NewButton("Change server", func() { u.disconnect() }),
+		container.NewHBox(
+			widget.NewButton("Log", func() { u.showLogs() }),
+			widget.NewButton("Change server", func() { u.disconnect() }),
+		),
 	)
 
 	buttons := container.NewHBox(

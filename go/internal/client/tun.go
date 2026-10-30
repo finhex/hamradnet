@@ -62,6 +62,16 @@ func (d *Daemon) ensureTun(ctx context.Context, identity *Identity) error {
 		return err
 	}
 	d.log.Info("tunnel interface up", "interface", device.name, "address", identity.VirtualIP)
+	if runtime.GOOS == "windows" {
+		// Windows sends a 255.255.255.255 broadcast out of the interface with
+		// the lowest metric only, so making that the tunnel lets games that
+		// announce themselves that way reach the other players. It is the fix
+		// Hamachi and Radmin VPN users are told to apply by hand.
+		if err := run("netsh", "interface", "ipv4", "set", "interface",
+			"interface="+device.name, "metric=1"); err != nil {
+			d.log.Warn("could not make the tunnel the preferred interface for LAN broadcasts", "err", err)
+		}
+	}
 
 	d.mu.Lock()
 	d.tun = device
@@ -69,6 +79,7 @@ func (d *Daemon) ensureTun(ctx context.Context, identity *Identity) error {
 
 	go d.tunReader(ctx, device)
 	go d.tunWriter(ctx, device)
+	go d.captureBroadcasts(ctx, device.name)
 	return nil
 }
 

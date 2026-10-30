@@ -16,6 +16,9 @@ use hamradnet::config::{default_config_path, Config};
 use hamradnet::daemon::{self, Daemon};
 use hamradnet::ipc::{Command, PeerReport, Response, Status};
 
+mod logs;
+use logs::LogBuffer;
+
 /// How often the window redraws while connected, so peer state looks live.
 const REFRESH: Duration = Duration::from_millis(500);
 
@@ -34,9 +37,8 @@ fn main() -> eframe::Result<()> {
         eprintln!();
         eprintln!("or, by hand:");
         eprintln!();
-        eprintln!("    sudo -E env DISPLAY=$DISPLAY \\");
-        eprintln!("        WAYLAND_DISPLAY=$WAYLAND_DISPLAY \\");
-        eprintln!("        XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \\");
+        eprintln!("    sudo -E env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \\");
+        eprintln!("        DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY \\");
         eprintln!("        hamradnet-gui");
         eprintln!();
         eprintln!("The app needs root to create the network interface, but it also");
@@ -44,12 +46,18 @@ fn main() -> eframe::Result<()> {
         std::process::exit(1);
     }
 
+    // Everything logged goes to the terminal as before, and is also kept for the
+    // app's own log window. Plain text, so a copied log pastes cleanly.
+    let logs = LogBuffer::default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "hamradnet=info".into()),
         )
+        .with_writer(logs.clone())
+        .with_ansi(false)
         .init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), os = std::env::consts::OS, "starting HamRadNet");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -62,7 +70,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "HamRadNet",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(|cc| Ok(Box::new(App::new(cc, logs)))),
     )
 }
 
@@ -105,10 +113,15 @@ struct App {
     /// Last message to show the user, and whether it was a failure.
     notice: Option<(String, bool)>,
     elevated: bool,
+
+    // Log window.
+    logs: LogBuffer,
+    show_logs: bool,
+    log_notice: Option<String>,
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, logs: LogBuffer) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -138,6 +151,9 @@ impl App {
             pending: Arc::new(Mutex::new(Pending::Idle)),
             notice: None,
             elevated: is_elevated(),
+            logs,
+            show_logs: false,
+            log_notice: None,
         };
 
         // Already set up from a previous run: connect without asking again.
@@ -257,6 +273,8 @@ impl eframe::App for App {
         } else {
             self.main_screen(ui);
         }
+        let ctx = ui.ctx().clone();
+        self.log_window(&ctx);
     }
 }
 
@@ -304,6 +322,9 @@ impl App {
                     if connect.clicked() {
                         self.connect();
                     }
+                    if ui.button("Log").on_hover_text("What the app has been doing").clicked() {
+                        self.show_logs = true;
+                    }
                 });
                 ui.add_space(4.0);
             });
@@ -345,6 +366,9 @@ impl App {
                         .clicked()
                     {
                         disconnecting = true;
+                    }
+                    if ui.button("Log").on_hover_text("What the app has been doing").clicked() {
+                        self.show_logs = true;
                     }
                     ui.label(egui::RichText::new(&status.name).weak());
                 });
@@ -577,6 +601,47 @@ impl App {
             egui::RichText::new(traffic_label(status.total_rx, status.total_tx)).weak(),
         );
         ui.end_row();
+    }
+
+    /// The log in a window of its own. It follows new lines as they come, and
+    /// Copy all puts the whole log on the clipboard, ready to paste into a chat
+    /// or an issue.
+    fn log_window(&mut self, ctx: &egui::Context) {
+        if !self.show_logs {
+            return;
+        }
+        let (text, count, _) = self.logs.snapshot();
+        let lines = if count == 1 { "1 line".to_string() } else { format!("{count} lines") };
+        let mut open = true;
+        egui::Window::new("Log")
+            .open(&mut open)
+            .default_size([860.0, 440.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy all").clicked() {
+                        ctx.copy_text(text.clone());
+                        self.log_notice = Some(format!("Copied {lines} to the clipboard"));
+                    }
+                    ui.label(self.log_notice.clone().unwrap_or_else(|| lines.clone()));
+                });
+                ui.separator();
+                let body = if text.is_empty() { "Nothing logged yet." } else { text.as_str() };
+                egui::ScrollArea::both()
+                    .auto_shrink(false)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(body).monospace())
+                                .selectable(true)
+                                .extend(),
+                        );
+                    });
+            });
+        if !open {
+            self.show_logs = false;
+            self.log_notice = None;
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {

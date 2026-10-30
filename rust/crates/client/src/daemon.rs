@@ -1182,6 +1182,8 @@ fn ensure_tun(
 
             // Reads block, so the device gets its own thread.
             let (tx, rx) = mpsc::unbounded_channel();
+            #[cfg(target_os = "linux")]
+            let broadcast_tx = tx.clone();
             let reader_tun = Arc::clone(&tun);
             std::thread::Builder::new()
                 .name("tun-reader".into())
@@ -1218,6 +1220,26 @@ fn ensure_tun(
                 .context("spawning the tun reader thread")?;
 
             tokio::spawn(tun_router(daemon.clone(), rx));
+
+            // Copies of games' LAN broadcasts join the tunnel's own outbound
+            // packets; see broadcast.rs for why they need fetching.
+            #[cfg(target_os = "linux")]
+            {
+                let source = daemon.clone();
+                let copied = crate::broadcast::spawn(
+                    INTERFACE_NAME,
+                    move || source.inner.lock().unwrap().identity.as_ref().map(|i| i.virtual_ip),
+                    move |packet| broadcast_tx.send(packet).is_ok(),
+                );
+                match copied {
+                    Ok(()) => tracing::info!("copying LAN game broadcasts into the tunnel"),
+                    Err(err) => tracing::warn!(
+                        %err,
+                        "cannot copy LAN broadcasts into the tunnel; games that announce \
+                         themselves to 255.255.255.255 will not be seen by the other players"
+                    ),
+                }
+            }
         }
     }
     Ok(())
