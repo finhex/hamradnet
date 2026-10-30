@@ -1,0 +1,529 @@
+// Command hamradnet-gui is the HamRadNet desktop app.
+//
+// One program that is both the window and the tunnel: the daemon runs in this
+// same process, so there is nothing to start separately and nothing to type.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+
+	"github.com/finhex/hamradnet/internal/client"
+	"github.com/finhex/hamradnet/internal/proto"
+)
+
+// refresh is how often the window redraws, so peer state looks live.
+const refresh = time.Second
+
+var version = "0.2.0-go"
+
+type ui struct {
+	window fyne.Window
+	log    *slog.Logger
+
+	mu         sync.Mutex
+	daemon     *client.Daemon
+	cancel     context.CancelFunc
+	configPath string
+
+	// Setup screen.
+	serverEntry *widget.Entry
+	nameEntry   *widget.Entry
+	setupError  *widget.Label
+
+	// Main screen.
+	statusLabel *widget.Label
+	addressText *widget.Label
+	content     *fyne.Container
+	networkBox  *fyne.Container
+	notice      *widget.Label
+}
+
+func main() {
+	// sudo drops DISPLAY and WAYLAND_DISPLAY, so the window cannot be opened and
+	// the app would die with an error from deep inside the toolkit. Say what
+	// actually went wrong, and how to fix it.
+	if runtime.GOOS == "linux" &&
+		os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		fmt.Fprint(os.Stderr, `HamRadNet cannot open a window: no display is available.
+
+This is almost always `+"`sudo`"+` stripping the display settings.
+`+"`sudo`"+` on its own will not work here. Use the launcher instead:
+
+    ./run-gui.sh
+
+or, by hand:
+
+    sudo -E env DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY \
+        XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR hamradnet-gui
+
+The app needs root to create the network interface, but it also needs your
+session's display to draw the window.
+`)
+		os.Exit(1)
+	}
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	application := app.NewWithID("net.hamradnet.app")
+	window := application.NewWindow("HamRadNet")
+	window.Resize(fyne.NewSize(920, 640))
+
+	u := &ui{window: window, log: log, configPath: client.DefaultConfigPath()}
+	u.build()
+	window.SetCloseIntercept(func() {
+		u.shutdown()
+		window.Close()
+	})
+	window.ShowAndRun()
+}
+
+func (u *ui) build() {
+	existing, err := client.LoadConfig(u.configPath)
+
+	u.serverEntry = widget.NewEntry()
+	u.serverEntry.SetPlaceHolder("203.0.113.45")
+	u.nameEntry = widget.NewEntry()
+	u.nameEntry.SetPlaceHolder("what your friends will see")
+	if err == nil {
+		u.serverEntry.SetText(existing.Server)
+		u.nameEntry.SetText(existing.Name)
+	} else {
+		u.nameEntry.SetText(defaultName())
+	}
+	u.setupError = widget.NewLabel("")
+	u.setupError.Wrapping = fyne.TextWrapWord
+
+	u.statusLabel = widget.NewLabel("")
+	u.addressText = widget.NewLabel("")
+	u.notice = widget.NewLabel("")
+	u.notice.Wrapping = fyne.TextWrapWord
+	u.networkBox = container.NewVBox()
+
+	u.content = container.NewStack()
+	u.window.SetContent(u.content)
+
+	// Already set up from a previous run: connect without asking again.
+	if err == nil && client.IsElevated() {
+		u.showMain()
+		u.connect()
+	} else {
+		u.showSetup()
+	}
+	go u.refreshLoop()
+}
+
+func (u *ui) showSetup() {
+	title := canvas.NewText("HamRadNet", theme.Color(theme.ColorNameForeground))
+	title.TextSize = 28
+	title.TextStyle = fyne.TextStyle{Bold: true}
+
+	form := widget.NewForm(
+		widget.NewFormItem("Server address", u.serverEntry),
+		widget.NewFormItem("Your name", u.nameEntry),
+	)
+	connect := widget.NewButton("Connect", func() { u.connect() })
+	connect.Importance = widget.HighImportance
+
+	items := []fyne.CanvasObject{
+		container.NewCenter(title),
+		container.NewCenter(widget.NewLabel("A private LAN for playing games with friends.")),
+		widget.NewSeparator(),
+	}
+	if !client.IsElevated() {
+		items = append(items, elevationWarning())
+	}
+	items = append(items,
+		form,
+		widget.NewLabel("Just the IP of your server. Port 7777 is assumed."),
+		container.NewCenter(connect),
+		u.setupError,
+	)
+
+	u.content.Objects = []fyne.CanvasObject{
+		container.NewPadded(container.NewVBox(items...)),
+	}
+	u.content.Refresh()
+}
+
+func (u *ui) showMain() {
+	header := container.NewBorder(nil, nil,
+		container.NewHBox(u.statusLabel, u.addressText),
+		widget.NewButton("Change server", func() { u.disconnect() }),
+	)
+
+	buttons := container.NewHBox(
+		layout.NewSpacer(),
+		widget.NewButton("Create a network", func() { u.createDialog() }),
+		widget.NewButton("Join a network", func() { u.joinDialog() }),
+	)
+
+	body := container.NewVBox(
+		container.NewBorder(nil, nil, widget.NewLabelWithStyle(
+			"Networks", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), buttons),
+		u.networkBox,
+	)
+
+	u.content.Objects = []fyne.CanvasObject{
+		container.NewPadded(container.NewBorder(
+			container.NewVBox(header, widget.NewSeparator()),
+			container.NewVBox(widget.NewSeparator(), u.notice),
+			nil, nil,
+			container.NewVScroll(body),
+		)),
+	}
+	u.content.Refresh()
+}
+
+func elevationWarning() fyne.CanvasObject {
+	what := "Close it and start it again with the run-gui.sh launcher, which asks for root."
+	if runtime.GOOS == "windows" {
+		what = "Close it, right-click hamradnet-gui.exe and choose \"Run as administrator\"."
+	}
+	title := widget.NewLabelWithStyle("This app needs administrator rights",
+		fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	detail := widget.NewLabel(what + "\nCreating a network adapter is not permitted otherwise.")
+	detail.Wrapping = fyne.TextWrapWord
+	return container.NewVBox(title, detail, widget.NewSeparator())
+}
+
+// connect creates or updates the config, then starts the daemon in this process.
+func (u *ui) connect() {
+	server := strings.TrimSpace(u.serverEntry.Text)
+	if server == "" {
+		u.setupError.SetText("Enter your server's address first.")
+		return
+	}
+	// A bare IP is the common case, so fill the port in rather than making
+	// people remember it.
+	if !strings.Contains(server, ":") {
+		server = fmt.Sprintf("%s:%d", server, proto.DefaultControlPort)
+	}
+	name := strings.TrimSpace(u.nameEntry.Text)
+	if name == "" {
+		name = defaultName()
+	}
+
+	config, err := client.LoadConfig(u.configPath)
+	if err != nil {
+		config, err = client.GenerateConfig(server, name)
+		if err != nil {
+			u.setupError.SetText("Could not create an identity: " + err.Error())
+			return
+		}
+	} else {
+		config.Server, config.Name = server, name
+	}
+	if err := config.Save(u.configPath); err != nil {
+		u.setupError.SetText("Could not save settings: " + err.Error())
+		return
+	}
+
+	daemon := client.NewDaemon(config, u.configPath, u.log)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	u.mu.Lock()
+	u.daemon, u.cancel = daemon, cancel
+	u.mu.Unlock()
+
+	go func() {
+		if err := daemon.ServeIPC(); err != nil {
+			u.log.Error("local control channel stopped", "err", err)
+		}
+	}()
+	go func() {
+		if err := daemon.Run(ctx, 0); err != nil {
+			u.log.Error("daemon stopped", "err", err)
+		}
+	}()
+
+	u.setupError.SetText("")
+	u.showMain()
+}
+
+// disconnect stops the tunnel and returns to the setup screen, so the server can
+// be changed without restarting.
+func (u *ui) disconnect() {
+	u.shutdown()
+	if config, err := client.LoadConfig(u.configPath); err == nil {
+		u.serverEntry.SetText(config.Server)
+		u.nameEntry.SetText(config.Name)
+	}
+	u.notice.SetText("")
+	u.showSetup()
+}
+
+func (u *ui) shutdown() {
+	u.mu.Lock()
+	cancel, daemon := u.cancel, u.daemon
+	u.cancel, u.daemon = nil, nil
+	u.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if daemon != nil {
+		daemon.Close()
+	}
+}
+
+func (u *ui) current() *client.Daemon {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.daemon
+}
+
+func (u *ui) refreshLoop() {
+	for range time.Tick(refresh) {
+		daemon := u.current()
+		if daemon == nil {
+			continue
+		}
+		status := daemon.Status()
+		peers := daemon.PeerReports()
+		fyne.Do(func() { u.render(status, peers) })
+	}
+}
+
+func (u *ui) render(status client.Status, peers []client.PeerReport) {
+	state := "Connecting…"
+	if status.Connected {
+		state = "Connected"
+	}
+	u.statusLabel.SetText(fmt.Sprintf("● %s · %s", state, status.Server))
+	if status.VirtualIP != "" {
+		u.addressText.SetText("   Your address: " + status.VirtualIP)
+	}
+	if status.LastError != "" && !status.Connected {
+		u.notice.SetText("Cannot reach the server: " + status.LastError)
+	}
+
+	sort.Slice(status.Networks, func(i, j int) bool {
+		return status.Networks[i].NetworkID < status.Networks[j].NetworkID
+	})
+
+	cards := make([]fyne.CanvasObject, 0, len(status.Networks))
+	for _, network := range status.Networks {
+		cards = append(cards, u.networkCard(network, status, peers))
+	}
+	if len(cards) == 0 {
+		cards = append(cards, widget.NewLabel(
+			"You are not in a network yet.\nCreate one and share the ID, or join a friend's."))
+	}
+	u.networkBox.Objects = cards
+	u.networkBox.Refresh()
+}
+
+// networkCard renders one network with everyone in it, so it reads as a room
+// rather than one flat list of everybody.
+func (u *ui) networkCard(network client.NetworkReport, status client.Status, peers []client.PeerReport) fyne.CanvasObject {
+	members := make([]client.PeerReport, 0, len(peers))
+	for _, peer := range peers {
+		for _, id := range peer.Networks {
+			if id == network.NetworkID {
+				members = append(members, peer)
+				break
+			}
+		}
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].VirtualIP < members[j].VirtualIP })
+	total := len(members) + 1
+
+	id := network.NetworkID
+	title := widget.NewLabelWithStyle(network.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	idLabel := widget.NewLabelWithStyle(id, fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+	count := widget.NewLabel(fmt.Sprintf("%d player%s", total, plural(total)))
+
+	actions := container.NewHBox(
+		count,
+		widget.NewButton("Copy ID", func() {
+			u.window.Clipboard().SetContent(id)
+			u.notice.SetText("Network ID copied.")
+		}),
+		widget.NewButton("Leave", func() { u.send(client.Request{Command: "leave", NetworkID: id}) }),
+		widget.NewButton("Delete", func() { u.confirmDelete(id, network.Name) }),
+	)
+
+	rows := []fyne.CanvasObject{
+		container.NewBorder(nil, nil, container.NewVBox(title, idLabel), actions),
+		widget.NewSeparator(),
+		memberRow("Address", "Name", "Status", "Ping", "Traffic", true),
+		memberRow(status.VirtualIP, status.Name+" (you)", stateWord(status.Connected),
+			pingText(status.ServerRTTMs), traffic(status.TotalRX, status.TotalTX), false),
+	}
+	for _, peer := range members {
+		rows = append(rows, memberRow(peer.VirtualIP, peer.Name, peer.Link,
+			pingText(peer.RTTMs), traffic(peer.RXBytes, peer.TXBytes), false))
+	}
+	if len(members) == 0 {
+		rows = append(rows, widget.NewLabel("Nobody else here yet - send a friend the ID above."))
+	}
+	return widget.NewCard("", "", container.NewVBox(rows...))
+}
+
+func memberRow(address, name, state, ping, bytes string, header bool) fyne.CanvasObject {
+	style := fyne.TextStyle{}
+	if header {
+		style = fyne.TextStyle{Bold: true}
+	}
+	cell := func(text string, mono bool) fyne.CanvasObject {
+		s := style
+		s.Monospace = mono && !header
+		return widget.NewLabelWithStyle(text, fyne.TextAlignLeading, s)
+	}
+	return container.NewGridWithColumns(5,
+		cell(address, true), cell(name, false), cell(state, false),
+		cell(ping, false), cell(bytes, false))
+}
+
+func stateWord(connected bool) string {
+	if connected {
+		return "online"
+	}
+	return "connecting"
+}
+
+func pingText(ms float64) string {
+	if ms <= 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.0f ms", ms)
+}
+
+// Plain words rather than arrows: not every font has the up/down glyphs.
+func traffic(rx, tx uint64) string {
+	return fmt.Sprintf("%s in · %s out", humanBytes(rx), humanBytes(tx))
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+func (u *ui) createDialog() {
+	name := widget.NewEntry()
+	name.SetPlaceHolder("game night")
+	password := widget.NewEntry()
+	password.SetPlaceHolder("friends will need this")
+
+	form := dialog.NewForm("Create a network", "Create", "Cancel",
+		[]*widget.FormItem{
+			widget.NewFormItem("Name", name),
+			widget.NewFormItem("Password", password),
+		},
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			if strings.TrimSpace(password.Text) == "" {
+				u.notice.SetText("A password is required.")
+				return
+			}
+			label := strings.TrimSpace(name.Text)
+			if label == "" {
+				label = "my network"
+			}
+			u.send(client.Request{Command: "create", Name: label, Password: password.Text})
+		}, u.window)
+	form.Resize(fyne.NewSize(420, 220))
+	form.Show()
+}
+
+func (u *ui) joinDialog() {
+	id := widget.NewEntry()
+	id.SetPlaceHolder("HAM-4821-9903")
+	password := widget.NewEntry()
+
+	form := dialog.NewForm("Join a network", "Join", "Cancel",
+		[]*widget.FormItem{
+			widget.NewFormItem("Network ID", id),
+			widget.NewFormItem("Password", password),
+		},
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			u.send(client.Request{
+				Command:   "join",
+				NetworkID: strings.ToUpper(strings.TrimSpace(id.Text)),
+				Password:  password.Text,
+			})
+		}, u.window)
+	form.Resize(fyne.NewSize(420, 220))
+	form.Show()
+}
+
+func (u *ui) confirmDelete(id, name string) {
+	dialog.ShowCustomConfirm("Delete this network?", "Delete it", "Cancel",
+		widget.NewLabel(fmt.Sprintf(
+			"'%s' (%s)\n\nThis removes it for everyone and the ID stops working.\n"+
+				"It cannot be undone, and only whoever created it can do this.\n\n"+
+				"To stop using it yourself without affecting anyone else, choose Leave.",
+			name, id)),
+		func(ok bool) {
+			if ok {
+				u.send(client.Request{Command: "delete", NetworkID: id})
+			}
+		}, u.window)
+}
+
+// send runs a command off the UI thread, so a slow coordinator cannot freeze the
+// window, and reports the outcome when it comes back.
+func (u *ui) send(req client.Request) {
+	daemon := u.current()
+	if daemon == nil {
+		return
+	}
+	u.notice.SetText("Working…")
+	go func() {
+		resp := daemon.Dispatch(req)
+		message := resp.Message
+		if message == "" && resp.OK {
+			message = "Done."
+		}
+		fyne.Do(func() { u.notice.SetText(strings.ReplaceAll(message, "\n", "  ")) })
+	}()
+}
+
+func humanBytes(n uint64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(n)
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d B", n)
+	}
+	return fmt.Sprintf("%.1f %s", value, units[unit])
+}
+
+func defaultName() string {
+	for _, key := range []string{"SUDO_USER", "USER", "USERNAME", "HOSTNAME", "COMPUTERNAME"} {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	return "player"
+}

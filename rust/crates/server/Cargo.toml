@@ -1,0 +1,25 @@
+[package]
+name = "hamradnet-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hamradnet-server"
+path = "src/main.rs"
+
+[dependencies]
+hamradnet-proto = { path = "../proto" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+snow = { workspace = true }

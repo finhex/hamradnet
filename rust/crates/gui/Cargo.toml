@@ -1,0 +1,21 @@
+[package]
+name = "hamradnet-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hamradnet-gui"
+path = "src/main.rs"
+
+[dependencies]
+hamradnet = { path = "../client" }
+hamradnet-proto = { path = "../proto" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eframe = "0.36.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

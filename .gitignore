@@ -1,0 +1,8 @@
+/rust/target
+/dist
+*.log
+networks.json
+psw.txt
+*.psw
+secrets*
+ip.txt

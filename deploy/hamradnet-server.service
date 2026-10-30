@@ -1,0 +1,36 @@
+# Coordinator, for a VPS without Docker.
+#
+#   sudo cp hamradnet-server /usr/local/bin/
+#   sudo useradd --system --home /var/lib/hamradnet --create-home hamradnet
+#   sudo cp deploy/hamradnet-server.service /etc/systemd/system/
+#   sudo systemctl enable --now hamradnet-server
+[Unit]
+Description=HamRadNet coordinator and relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hamradnet
+Group=hamradnet
+WorkingDirectory=/var/lib/hamradnet
+ExecStart=/usr/local/bin/hamradnet-server --bind 0.0.0.0 --store /var/lib/hamradnet/networks.json
+Environment=RUST_LOG=hamradnet_server=info
+Restart=always
+RestartSec=3
+
+# The coordinator only needs its two sockets, so take everything else away.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/hamradnet
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
