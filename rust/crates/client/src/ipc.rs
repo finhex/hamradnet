@@ -34,6 +34,15 @@ pub enum Command {
     JoinNetwork { network_id: String, password: String },
     LeaveNetwork { network_id: String },
     DeleteNetwork { network_id: String },
+    /// Points the daemon at a coordinator, and renames this player unless
+    /// `name` is empty. It is how the app sets up a daemon running as a service.
+    Configure {
+        server: String,
+        #[serde(default)]
+        name: String,
+    },
+    /// The daemon's recent log, as the message of an `Ok` reply.
+    Logs,
 }
 
 /// Note the struct variants. This enum is internally tagged, and serde cannot
@@ -200,6 +209,22 @@ mod tests {
         }
     }
 
+    /// Exactly what the Go command line and app send; see ipc_wire.go there.
+    #[test]
+    fn the_service_commands_decode_as_go_sends_them() {
+        let configure: Request = serde_json::from_str(
+            r#"{"token":"t","command":{"cmd":"configure","server":"s:1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            configure.command,
+            Command::Configure { ref server, ref name } if server == "s:1" && name.is_empty()
+        ));
+        let logs: Request =
+            serde_json::from_str(r#"{"token":"t","command":{"cmd":"logs"}}"#).unwrap();
+        assert!(matches!(logs.command, Command::Logs));
+    }
+
     #[test]
     fn every_command_round_trips() {
         for command in [
@@ -209,6 +234,8 @@ mod tests {
             Command::JoinNetwork { network_id: "HAM-1-2".into(), password: "p".into() },
             Command::LeaveNetwork { network_id: "HAM-1-2".into() },
             Command::DeleteNetwork { network_id: "HAM-1-2".into() },
+            Command::Configure { server: "203.0.113.45:7777".into(), name: "n".into() },
+            Command::Logs,
         ] {
             let request = Request { token: "t".into(), command };
             let encoded = serde_json::to_string(&request).unwrap();

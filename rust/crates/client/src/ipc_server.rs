@@ -31,6 +31,12 @@ async fn run(daemon: Daemon) -> Result<()> {
 
     let path = ipc_path();
     crate::ipc::save_endpoint(&path, &Endpoint { port, token: token.clone() })?;
+    #[cfg(unix)]
+    if let Some((uid, gid)) = daemon.ipc_owner() {
+        use anyhow::Context as _;
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+            .with_context(|| format!("giving {} to its user", path.display()))?;
+    }
     tracing::info!(port, path = %path.display(), "local control channel ready");
 
     loop {
@@ -184,6 +190,19 @@ pub async fn dispatch(daemon: &Daemon, command: Command) -> Response {
                 None => timed_out(),
             }
         }
+
+        Command::Configure { server, name } => match daemon.configure(&server, &name) {
+            Ok(()) => {
+                let (server, name) = daemon.server_and_name();
+                Response::Ok { message: format!("Connecting to {server} as {name}.") }
+            }
+            Err(err) => Response::Error { message: format!("{err:#}") },
+        },
+
+        Command::Logs => match daemon.logs() {
+            Some(logs) => Response::Ok { message: logs.snapshot().0 },
+            None => Response::Error { message: "this daemon keeps no log of its own".into() },
+        },
     }
 }
 

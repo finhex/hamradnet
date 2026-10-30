@@ -133,7 +133,7 @@ mkdir -p "$(dirname "$BINARY")"
 echo "==> Building the $IMPL coordinator for $ARCH (static, runs on any Linux)"
 if [[ "$IMPL" == go ]]; then
   ( cd go && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath \
-      -ldflags="-s -w -X main.version=0.3.0-go" \
+      -ldflags="-s -w -X main.version=0.4.0-go" \
       -o "../$BINARY" ./cmd/hamradnet-server )
 else
   if ! rustup target list --installed 2>/dev/null | grep -qx "$RUST_TARGET"; then

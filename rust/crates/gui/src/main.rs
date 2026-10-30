@@ -8,16 +8,15 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
-use hamradnet::config::{default_config_path, Config};
+use hamradnet::config::{default_config_path, ipc_path, normalize_server, Config};
 use hamradnet::daemon::{self, Daemon};
-use hamradnet::ipc::{Command, PeerReport, Response, Status};
-
-mod logs;
-use logs::LogBuffer;
+use hamradnet::ipc::{self, Command, PeerReport, Response, Status};
+use hamradnet::logs::LogBuffer;
 
 /// How often the window redraws while connected, so peer state looks live.
 const REFRESH: Duration = Duration::from_millis(500);
@@ -92,10 +91,49 @@ enum Dialog {
     ConfirmDelete(String, String),
 }
 
+/// What the window drives. Either the tunnel runs inside this app, which then
+/// needs root or Administrator, or it runs as the HamRadNet service and the
+/// app, running as an ordinary user, talks to it over the local control
+/// channel, the same one the command line uses.
+enum Backend {
+    Embedded(Daemon),
+    Service(Arc<ServiceView>),
+}
+
+/// The service as last seen. Asking it is a request over the local control
+/// channel, so a background task keeps this current and the window reads it,
+/// rather than every redraw waiting on a request.
+#[derive(Default)]
+struct ServiceView {
+    /// The last answer that came back.
+    snapshot: Mutex<Option<(Status, Vec<PeerReport>)>>,
+    /// Why the last request failed, if it did.
+    error: Mutex<Option<String>>,
+    log: Mutex<String>,
+    /// Fetch the log too, while the log window is open.
+    want_log: AtomicBool,
+}
+
+async fn fetch_snapshot() -> anyhow::Result<(Status, Vec<PeerReport>)> {
+    let path = ipc_path();
+    let status = match ipc::send(&path, Command::Status).await? {
+        Response::Status { status } => status,
+        Response::Error { message } => anyhow::bail!(message),
+        _ => anyhow::bail!("unexpected reply to a status request"),
+    };
+    let peers = match ipc::send(&path, Command::Peers).await? {
+        Response::Peers { peers } => peers,
+        _ => Vec::new(),
+    };
+    Ok((status, peers))
+}
+
 struct App {
     runtime: tokio::runtime::Runtime,
     config_path: PathBuf,
-    daemon: Option<Daemon>,
+    backend: Option<Backend>,
+    /// Showing the setup screen rather than the networks.
+    setup: bool,
 
     // Setup screen.
     server_input: String,
@@ -133,7 +171,8 @@ impl App {
         let mut app = App {
             runtime,
             config_path,
-            daemon: None,
+            backend: None,
+            setup: true,
             server_input: existing
                 .as_ref()
                 .map(|c| c.server.clone())
@@ -156,31 +195,87 @@ impl App {
             log_notice: None,
         };
 
-        // Already set up from a previous run: connect without asking again.
-        if existing.is_some() && app.elevated {
+        if let Some(view) = app.find_service() {
+            // The tunnel already runs as a service: drive that, with no root
+            // needed.
+            tracing::info!("found the HamRadNet service; this app controls it");
+            if let Some((status, _)) = view.snapshot.lock().unwrap().as_ref() {
+                app.server_input = status.server.clone();
+                if !status.name.is_empty() {
+                    app.name_input = status.name.clone();
+                }
+                app.setup = status.server.is_empty();
+            }
+            app.backend = Some(Backend::Service(view));
+        } else if existing.is_some() && app.elevated {
+            // Already set up from a previous run: connect without asking again.
             app.connect();
         }
         app
     }
 
-    /// Creates or updates the config, then starts the daemon in this process.
+    /// The running service, if there is one this user may drive, with a task
+    /// keeping its view current. The install script sets it up so that the user
+    /// who installed it can.
+    fn find_service(&self) -> Option<Arc<ServiceView>> {
+        let first = self.runtime.block_on(fetch_snapshot()).ok()?;
+        let view = Arc::new(ServiceView::default());
+        *view.snapshot.lock().unwrap() = Some(first);
+        let polled = Arc::clone(&view);
+        self.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(REFRESH).await;
+                match fetch_snapshot().await {
+                    Ok(snapshot) => {
+                        *polled.snapshot.lock().unwrap() = Some(snapshot);
+                        *polled.error.lock().unwrap() = None;
+                    }
+                    Err(err) => *polled.error.lock().unwrap() = Some(format!("{err:#}")),
+                }
+                if polled.want_log.load(Ordering::Relaxed) {
+                    if let Ok(Response::Ok { message }) = ipc::send(&ipc_path(), Command::Logs).await {
+                        *polled.log.lock().unwrap() = message;
+                    }
+                }
+            }
+        });
+        Some(view)
+    }
+
+    fn is_service(&self) -> bool {
+        matches!(self.backend, Some(Backend::Service(_)))
+    }
+
+    /// Points the service at the chosen server, or, with no service, creates or
+    /// updates the config and starts the daemon in this process.
     fn connect(&mut self) {
-        let server = self.server_input.trim().to_string();
+        // A bare IP is the common case, so the port is filled in rather than
+        // making people remember it.
+        let server = normalize_server(&self.server_input);
         if server.is_empty() {
             self.setup_error = Some("Enter your server's address first.".into());
             return;
         }
-        // A bare IP is the common case, so fill the port in rather than making
-        // people remember it.
-        let server = if server.contains(':') {
-            server
-        } else {
-            format!("{server}:{}", hamradnet_proto::DEFAULT_CONTROL_PORT)
-        };
         let name = {
             let trimmed = self.name_input.trim();
             if trimmed.is_empty() { default_name() } else { trimmed.to_string() }
         };
+
+        if self.is_service() {
+            let reply = self.runtime.block_on(ipc::send(&ipc_path(), Command::Configure { server, name }));
+            match reply {
+                Ok(Response::Ok { .. }) => {
+                    self.setup_error = None;
+                    self.setup = false;
+                }
+                Ok(Response::Error { message }) => self.setup_error = Some(message),
+                Ok(_) => self.setup_error = Some("Unexpected reply from the service.".into()),
+                Err(err) => {
+                    self.setup_error = Some(format!("The HamRadNet service did not answer: {err:#}"))
+                }
+            }
+            return;
+        }
 
         let config = match Config::load(&self.config_path) {
             Ok(mut existing) => {
@@ -207,12 +302,14 @@ impl App {
             },
         };
 
+        let options = daemon::Options { logs: Some(self.logs.clone()), ipc_owner: None };
         match self
             .runtime
-            .block_on(daemon::spawn(config, self.config_path.clone(), 0))
+            .block_on(daemon::spawn(config, self.config_path.clone(), 0, options))
         {
             Ok(daemon) => {
-                self.daemon = Some(daemon);
+                self.backend = Some(Backend::Embedded(daemon));
+                self.setup = false;
                 self.setup_error = None;
             }
             Err(err) => self.setup_error = Some(format!("Could not start: {err:#}")),
@@ -221,13 +318,29 @@ impl App {
 
     /// Runs a command on the runtime without blocking the window.
     fn send(&mut self, command: Command) {
-        let Some(daemon) = self.daemon.clone() else { return };
         let slot = Arc::clone(&self.pending);
-        *slot.lock().unwrap() = Pending::Running;
-        self.runtime.spawn(async move {
-            let response = hamradnet::ipc_server::dispatch(&daemon, command).await;
-            *slot.lock().unwrap() = Pending::Done(response);
-        });
+        match &self.backend {
+            None => return,
+            Some(Backend::Embedded(daemon)) => {
+                let daemon = daemon.clone();
+                *slot.lock().unwrap() = Pending::Running;
+                self.runtime.spawn(async move {
+                    let response = hamradnet::ipc_server::dispatch(&daemon, command).await;
+                    *slot.lock().unwrap() = Pending::Done(response);
+                });
+            }
+            Some(Backend::Service(_)) => {
+                *slot.lock().unwrap() = Pending::Running;
+                self.runtime.spawn(async move {
+                    let response = ipc::send(&ipc_path(), command).await.unwrap_or_else(|err| {
+                        Response::Error {
+                            message: format!("The HamRadNet service did not answer: {err:#}"),
+                        }
+                    });
+                    *slot.lock().unwrap() = Pending::Done(response);
+                });
+            }
+        }
     }
 
     fn is_busy(&self) -> bool {
@@ -257,9 +370,13 @@ impl App {
     }
 
     fn snapshot(&self) -> Option<(Status, Vec<PeerReport>)> {
-        let daemon = self.daemon.as_ref()?;
-        let guard = daemon.inner().lock().unwrap();
-        Some((daemon::status(&guard), daemon::peer_reports(&guard)))
+        match self.backend.as_ref()? {
+            Backend::Embedded(daemon) => {
+                let guard = daemon.inner().lock().unwrap();
+                Some((daemon::status(&guard), daemon::peer_reports(&guard)))
+            }
+            Backend::Service(view) => view.snapshot.lock().unwrap().clone(),
+        }
     }
 }
 
@@ -268,7 +385,12 @@ impl eframe::App for App {
         self.collect_result();
         ui.ctx().request_repaint_after(REFRESH);
 
-        if self.daemon.is_none() {
+        if let Some(Backend::Service(view)) = &self.backend {
+            if let Some(err) = view.error.lock().unwrap().clone() {
+                self.notice = Some((format!("The HamRadNet service is not answering: {err}"), true));
+            }
+        }
+        if self.setup || self.backend.is_none() {
             self.setup_screen(ui);
         } else {
             self.main_screen(ui);
@@ -288,7 +410,10 @@ impl App {
             });
             ui.add_space(24.0);
 
-            if !self.elevated {
+            if self.is_service() {
+                ui.label("HamRadNet runs as a service on this computer. Choose a server to connect it to.");
+                ui.add_space(12.0);
+            } else if !self.elevated {
                 elevation_warning(ui);
                 ui.add_space(12.0);
             }
@@ -316,7 +441,7 @@ impl App {
 
                 ui.horizontal(|ui| {
                     let connect = ui.add_enabled(
-                        self.elevated,
+                        self.elevated || self.is_service(),
                         egui::Button::new("  Connect  ").min_size(egui::vec2(120.0, 30.0)),
                     );
                     if connect.clicked() {
@@ -349,7 +474,9 @@ impl App {
                 } else {
                     (egui::Color32::from_rgb(220, 160, 60), "Connecting…")
                 };
-                ui.label(egui::RichText::new("●").color(colour).size(16.0));
+                // Drawn rather than written: the bundled fonts have no "●".
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 5.0, colour);
                 ui.label(egui::RichText::new(text).strong());
                 ui.label(format!("· {}", status.server));
 
@@ -552,16 +679,28 @@ impl App {
         }
     }
 
-    /// Stops the tunnel and returns to the setup screen with the current
-    /// settings filled in, so the server can be changed without restarting.
+    /// Returns to the setup screen with the current settings filled in, so the
+    /// server can be changed without restarting. A tunnel in this process is
+    /// stopped; the service keeps running until it is given the new server.
     fn disconnect(&mut self) {
-        if let Some(daemon) = self.daemon.take() {
-            daemon.shutdown();
+        match &self.backend {
+            Some(Backend::Service(view)) => {
+                if let Some((status, _)) = view.snapshot.lock().unwrap().as_ref() {
+                    self.server_input = status.server.clone();
+                    self.name_input = status.name.clone();
+                }
+            }
+            _ => {
+                if let Some(Backend::Embedded(daemon)) = self.backend.take() {
+                    daemon.shutdown();
+                }
+                if let Ok(config) = Config::load(&self.config_path) {
+                    self.server_input = config.server;
+                    self.name_input = config.name;
+                }
+            }
         }
-        if let Ok(config) = Config::load(&self.config_path) {
-            self.server_input = config.server;
-            self.name_input = config.name;
-        }
+        self.setup = true;
         self.notice = None;
         self.dialog = Dialog::None;
     }
@@ -607,10 +746,24 @@ impl App {
     /// Copy all puts the whole log on the clipboard, ready to paste into a chat
     /// or an issue.
     fn log_window(&mut self, ctx: &egui::Context) {
+        // The log of whatever runs the tunnel: the service's own while the app
+        // drives it, otherwise this app's, which includes a tunnel run
+        // in-process.
+        let service = match &self.backend {
+            Some(Backend::Service(view)) => Some(Arc::clone(view)),
+            _ => None,
+        };
+        if let Some(view) = &service {
+            view.want_log.store(self.show_logs, Ordering::Relaxed);
+        }
         if !self.show_logs {
             return;
         }
-        let (text, count, _) = self.logs.snapshot();
+        let text = match &service {
+            Some(view) => view.log.lock().unwrap().clone(),
+            None => self.logs.snapshot().0,
+        };
+        let count = if text.is_empty() { 0 } else { text.lines().count() };
         let lines = if count == 1 { "1 line".to_string() } else { format!("{count} lines") };
         let mut open = true;
         egui::Window::new("Log")
@@ -845,8 +998,10 @@ fn elevation_warning(ui: &mut egui::Ui) {
                 "Close it, right-click hamradnet-gui.exe and choose \"Run as administrator\". \
                  Creating a network adapter is not something Windows allows otherwise."
             } else {
-                "Close it and start it again with sudo. Creating a network interface \
-                 needs root."
+                "Close it and start it again with the run-gui.sh launcher, which asks for \
+                 root, or install the HamRadNet service once (install.sh in the service \
+                 download), after which the app needs no password. Creating a network \
+                 interface needs root."
             });
         });
 }

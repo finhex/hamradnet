@@ -23,12 +23,14 @@ import (
 
 // Command names on the wire, by the Go name.
 var wireCommands = map[string]string{
-	"status": "status",
-	"peers":  "peers",
-	"create": "create_network",
-	"join":   "join_network",
-	"leave":  "leave_network",
-	"delete": "delete_network",
+	"status":    "status",
+	"peers":     "peers",
+	"create":    "create_network",
+	"join":      "join_network",
+	"leave":     "leave_network",
+	"delete":    "delete_network",
+	"configure": "configure",
+	"logs":      "logs",
 }
 
 type wireCommand struct {
@@ -36,6 +38,7 @@ type wireCommand struct {
 	Name      string `json:"name,omitempty"`
 	NetworkID string `json:"network_id,omitempty"`
 	Password  string `json:"password,omitempty"`
+	Server    string `json:"server,omitempty"`
 }
 
 func (r Request) MarshalJSON() ([]byte, error) {
@@ -46,7 +49,8 @@ func (r Request) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Token   string      `json:"token"`
 		Command wireCommand `json:"command"`
-	}{r.Token, wireCommand{Cmd: cmd, Name: r.Name, NetworkID: r.NetworkID, Password: r.Password}})
+	}{r.Token, wireCommand{Cmd: cmd, Name: r.Name, NetworkID: r.NetworkID, Password: r.Password,
+		Server: r.Server}})
 }
 
 func (r *Request) UnmarshalJSON(data []byte) error {
@@ -58,7 +62,8 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*r = Request{Token: wire.Token, Command: wire.Command.Cmd,
-		Name: wire.Command.Name, NetworkID: wire.Command.NetworkID, Password: wire.Command.Password}
+		Name: wire.Command.Name, NetworkID: wire.Command.NetworkID, Password: wire.Command.Password,
+		Server: wire.Command.Server}
 	for goName, wireName := range wireCommands {
 		if wireName == wire.Command.Cmd {
 			r.Command = goName

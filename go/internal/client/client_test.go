@@ -304,6 +304,22 @@ func TestConfigRoundTripsThroughDisk(t *testing.T) {
 	}
 }
 
+func TestServerAddressesGetTheDefaultPort(t *testing.T) {
+	for typed, want := range map[string]string{
+		"203.0.113.45":       "203.0.113.45:7777",
+		" 203.0.113.45 ":     "203.0.113.45:7777",
+		"203.0.113.45:9000":  "203.0.113.45:9000",
+		"vpn.example.com":    "vpn.example.com:7777",
+		"2001:db8::1":        "[2001:db8::1]:7777",
+		"[2001:db8::1]:7777": "[2001:db8::1]:7777",
+		"":                   "",
+	} {
+		if got := NormalizeServer(typed); got != want {
+			t.Errorf("NormalizeServer(%q) = %q, want %q", typed, got, want)
+		}
+	}
+}
+
 // The Rust client shares the config file and cannot load "networks": null, so a
 // fresh config, never joined to anything, must still write a list.
 func TestAFreshConfigWritesAnEmptyListForRust(t *testing.T) {

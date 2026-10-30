@@ -6,10 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 
+	"github.com/finhex/hamradnet/internal/proto"
 	"github.com/finhex/hamradnet/internal/session"
 )
 
@@ -83,7 +87,9 @@ func LoadConfig(path string) (*Config, error) {
 // passwords.
 func (c *Config) Save(path string) error {
 	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		// The folder is open, so the app can reach the local control file
+		// when the daemon runs as a service; the files in it stay owner-only.
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
@@ -120,6 +126,19 @@ func (c *Config) ForgetNetwork(networkID string) {
 		}
 	}
 	c.Networks = kept
+}
+
+// NormalizeServer tidies a server address as typed, adding the default port if
+// there is none, since a bare IP is what people have to hand.
+func NormalizeServer(server string) string {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(server); err != nil {
+		return net.JoinHostPort(strings.Trim(server, "[]"), strconv.Itoa(proto.DefaultControlPort))
+	}
+	return server
 }
 
 // DefaultConfigPath is where the config lives unless $HAMRADNET_CONFIG says

@@ -1,4 +1,4 @@
-//! Recent log lines, kept for the app's log window.
+//! Recent log lines, kept for the app's log window and `hamradnet logs`.
 //!
 //! Every log event still goes to stderr as before; this keeps a copy of the
 //! most recent ones so the app can show them, and copy them for whoever is

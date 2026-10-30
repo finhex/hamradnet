@@ -21,12 +21,13 @@ use hamradnet_proto::{
 };
 use rand::Rng;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 use crate::config::Config;
 use crate::framing::{read_frame, write_frame};
 use crate::ip;
 use crate::ipc;
+use crate::logs::LogBuffer;
 use crate::peers::{should_initiate, Link, PeerTable, SendPath};
 use crate::session;
 use crate::tun::{Tun, TunConfig};
@@ -131,6 +132,23 @@ enum Via {
     Relay,
 }
 
+/// What status reports before anyone has chosen a server. The same words as the
+/// Go client's.
+const NO_SERVER_YET: &str =
+    "no server chosen yet: pick one in the app, or run `hamradnet connect --server HOST`";
+
+/// How the daemon is being hosted, for the parts that differ between the app
+/// and a background service.
+#[derive(Clone, Default)]
+pub struct Options {
+    /// Where the daemon's own log is also kept, so it can hand it out over the
+    /// local control channel.
+    pub logs: Option<LogBuffer>,
+    /// The user, as `(uid, gid)`, given the local control file, so that
+    /// user's app and command line can drive a daemon running as root.
+    pub ipc_owner: Option<(u32, u32)>,
+}
+
 #[derive(Clone)]
 pub struct Daemon {
     inner: Arc<Mutex<Inner>>,
@@ -143,9 +161,55 @@ pub struct Daemon {
     /// Held so the interface can be torn down on shutdown.
     tun: Arc<Mutex<Option<Arc<Tun>>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Wakes the connection loop when a server is chosen or changed.
+    reconfigure: Arc<Notify>,
+    options: Arc<Options>,
 }
 
 impl Daemon {
+    pub fn logs(&self) -> Option<&LogBuffer> {
+        self.options.logs.as_ref()
+    }
+
+    pub fn ipc_owner(&self) -> Option<(u32, u32)> {
+        self.options.ipc_owner
+    }
+
+    /// Points the daemon at a coordinator, and renames this player unless
+    /// `name` is empty, from the app or `hamradnet connect`. The choice is
+    /// saved, and a change of server takes effect at once.
+    pub fn configure(&self, server: &str, name: &str) -> Result<()> {
+        let server = crate::config::normalize_server(server);
+        if server.is_empty() {
+            bail!("no server address given");
+        }
+        let changed = {
+            let mut guard = self.inner.lock().unwrap();
+            let changed = guard.config.server != server
+                || (!name.is_empty() && guard.config.name != name);
+            guard.config.server = server.clone();
+            if !name.is_empty() {
+                guard.config.name = name.to_string();
+            }
+            guard.config.save(&guard.config_path).context("saving the settings")?;
+            if changed {
+                guard.last_error = None;
+            }
+            changed
+        };
+        if changed {
+            tracing::info!(%server, name, "server chosen");
+            self.reconfigure.notify_one();
+        }
+        Ok(())
+    }
+
+    /// The server and name now in use, for replies to the app.
+    pub fn server_and_name(&self) -> (String, String) {
+        let guard = self.inner.lock().unwrap();
+        (guard.config.server.clone(), guard.config.name.clone())
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
@@ -206,7 +270,12 @@ impl Daemon {
 /// Everything runs as background tasks, so a caller that wants to drive the
 /// daemon rather than just host it - the GUI, which embeds it in-process -
 /// keeps the handle and uses it directly instead of going over the local socket.
-pub async fn spawn(config: Config, config_path: PathBuf, udp_port: u16) -> Result<Daemon> {
+pub async fn spawn(
+    config: Config,
+    config_path: PathBuf,
+    udp_port: u16,
+    options: Options,
+) -> Result<Daemon> {
     let socket = Arc::new(
         UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), udp_port))
             .await
@@ -219,7 +288,6 @@ pub async fn spawn(config: Config, config_path: PathBuf, udp_port: u16) -> Resul
     let (to_server, server_rx) = mpsc::unbounded_channel::<ClientMsg>();
     let (events, _) = broadcast::channel(64);
 
-    let server = config.server.clone();
     let inner = Arc::new(Mutex::new(Inner {
         config,
         config_path,
@@ -250,6 +318,8 @@ pub async fn spawn(config: Config, config_path: PathBuf, udp_port: u16) -> Resul
         events,
         tun: Arc::clone(&tun_slot),
         tasks: Arc::clone(&tasks),
+        reconfigure: Arc::new(Notify::new()),
+        options: Arc::new(options),
     };
     let server_queue: ServerQueue = Arc::new(tokio::sync::Mutex::new(server_rx));
 
@@ -259,7 +329,6 @@ pub async fn spawn(config: Config, config_path: PathBuf, udp_port: u16) -> Resul
         tokio::spawn(crate::ipc_server::serve(daemon.clone())),
         tokio::spawn(reconnect_loop(
             daemon.clone(),
-            server,
             tun_slot,
             tun_rx_slot,
             bound.port(),
@@ -271,8 +340,13 @@ pub async fn spawn(config: Config, config_path: PathBuf, udp_port: u16) -> Resul
 }
 
 /// Hosts the daemon for the lifetime of the process, for the CLI's `up`.
-pub async fn run(config: Config, config_path: PathBuf, udp_port: u16) -> Result<()> {
-    let _daemon = spawn(config, config_path, udp_port).await?;
+pub async fn run(
+    config: Config,
+    config_path: PathBuf,
+    udp_port: u16,
+    options: Options,
+) -> Result<()> {
+    let _daemon = spawn(config, config_path, udp_port, options).await?;
     // The work happens in background tasks; block here until the process stops.
     std::future::pending::<()>().await;
     Ok(())
@@ -282,7 +356,6 @@ pub async fn run(config: Config, config_path: PathBuf, udp_port: u16) -> Result<
 #[allow(clippy::too_many_arguments)]
 async fn reconnect_loop(
     daemon: Daemon,
-    server: String,
     tun_slot: Arc<Mutex<Option<Arc<Tun>>>>,
     tun_rx_slot: Arc<Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>>,
     local_udp_port: u16,
@@ -290,35 +363,60 @@ async fn reconnect_loop(
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match control_session(
+        // Running as a service, the daemon starts before anyone has chosen a
+        // server, and waits for the app to choose one.
+        let server = daemon.inner.lock().unwrap().config.server.clone();
+        if server.is_empty() {
+            daemon.inner.lock().unwrap().last_error = Some(NO_SERVER_YET.into());
+            daemon.reconfigure.notified().await;
+            continue;
+        }
+
+        let session = control_session(
             &daemon,
             &server,
             &tun_slot,
             &tun_rx_slot,
             local_udp_port,
             Arc::clone(&server_queue),
-        )
-        .await
-        {
-            // A connection that came up and later dropped is not a reason to
-            // keep backing off, so the next attempt starts from the bottom.
-            Ok(()) => {
-                tracing::warn!("control connection closed");
-                backoff = Duration::from_secs(1);
-            }
-            Err(err) => {
-                tracing::warn!(%err, "control connection failed");
-                daemon.inner.lock().unwrap().last_error = Some(format!("{err:#}"));
-            }
-        }
+        );
+        // A new server ends the session in progress; dropping it closes the
+        // connection.
+        let outcome = tokio::select! {
+            result = session => Some(result),
+            () = daemon.reconfigure.notified() => None,
+        };
         {
             let mut guard = daemon.inner.lock().unwrap();
             guard.connected = false;
             guard.networks.clear();
             guard.peers = PeerTable::default();
         }
+        match outcome {
+            None => {
+                tracing::info!("switching to the new server");
+                backoff = Duration::from_secs(1);
+                continue;
+            }
+            // A connection that came up and later dropped is not a reason to
+            // keep backing off, so the next attempt starts from the bottom.
+            Some(Ok(())) => {
+                tracing::warn!("control connection closed");
+                backoff = Duration::from_secs(1);
+            }
+            Some(Err(err)) => {
+                tracing::warn!(%err, "control connection failed");
+                daemon.inner.lock().unwrap().last_error = Some(format!("{err:#}"));
+            }
+        }
         tracing::info!(seconds = backoff.as_secs(), "reconnecting");
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            () = tokio::time::sleep(backoff) => {}
+            () = daemon.reconfigure.notified() => {
+                backoff = Duration::from_secs(1);
+                continue;
+            }
+        }
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }

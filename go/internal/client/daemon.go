@@ -95,7 +95,23 @@ type Daemon struct {
 	// steal each other's outcome.
 	subscribers []chan Event
 	log         *slog.Logger
+
+	// logs keeps recent log lines for the app and `hamradnet logs`; nil when
+	// this process does not keep them.
+	logs *LogBuffer
+	// ipcOwner, when set, is given the local control file, so that user's app
+	// and command line can drive a daemon running as root, as a service.
+	ipcOwner *[2]int
+	// configured wakes the connection loop when a server is chosen or changed.
+	configured chan struct{}
+	// endSession drops the coordinator connection in progress, and switching
+	// marks that as a change of server rather than a failure.
+	endSession context.CancelFunc
+	switching  bool
 }
+
+// noServerYet is what status reports before anyone has chosen a server.
+const noServerYet = "no server chosen yet: pick one in the app, or run `hamradnet connect --server HOST`"
 
 // NewDaemon prepares a daemon. Nothing runs until Run is called.
 func NewDaemon(config *Config, configPath string, log *slog.Logger) *Daemon {
@@ -109,7 +125,54 @@ func NewDaemon(config *Config, configPath string, log *slog.Logger) *Daemon {
 		toTun:         make(chan []byte, 256),
 		toServer:      make(chan []byte, 64),
 		log:           log,
+		configured:    make(chan struct{}, 1),
 	}
+}
+
+// SetLogBuffer gives the daemon the buffer its own log is also written to, so
+// it can hand the log out over the local control channel.
+func (d *Daemon) SetLogBuffer(logs *LogBuffer) { d.logs = logs }
+
+// SetIPCOwner makes the local control file belong to this user, so that
+// user's app and command line can drive the daemon without root. Call it before
+// ServeIPC.
+func (d *Daemon) SetIPCOwner(uid, gid int) { d.ipcOwner = &[2]int{uid, gid} }
+
+// Configure points the daemon at a coordinator, and renames this player if name
+// is not empty, from the app or `hamradnet connect`. The choice is saved, and a
+// change of server takes effect at once.
+func (d *Daemon) Configure(server, name string) error {
+	server = NormalizeServer(server)
+	if server == "" {
+		return errors.New("no server address given")
+	}
+	d.mu.Lock()
+	changed := d.config.Server != server || (name != "" && d.config.Name != name)
+	d.config.Server = server
+	if name != "" {
+		d.config.Name = name
+	}
+	err := d.config.Save(d.configPath)
+	end := d.endSession
+	if changed {
+		d.lastError = ""
+		d.switching = end != nil
+	}
+	d.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("saving the settings: %w", err)
+	}
+	if changed {
+		d.log.Info("server chosen", "server", server, "name", name)
+		if end != nil {
+			end()
+		}
+		select {
+		case d.configured <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
 // SetInterfaceName overrides the interface this client creates. It must be
@@ -152,29 +215,63 @@ func (d *Daemon) Run(ctx context.Context, udpPort int) error {
 	// Reconnect forever; each pass rebuilds the peer table from a fresh roster.
 	backoff := time.Second
 	for ctx.Err() == nil {
-		err := d.controlSession(ctx, uint16(bound.Port))
-		if err != nil {
-			d.log.Warn("control connection failed", "err", err)
-			d.mu.Lock()
+		// Running as a service, the daemon starts before anyone has chosen a
+		// server, and waits for the app to choose one.
+		d.mu.Lock()
+		server := d.config.Server
+		if server == "" {
+			d.lastError = noServerYet
+		}
+		d.mu.Unlock()
+		if server == "" {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-d.configured:
+			}
+			continue
+		}
+
+		session, endSession := context.WithCancel(ctx)
+		d.mu.Lock()
+		d.endSession = endSession
+		d.mu.Unlock()
+		err := d.controlSession(session, uint16(bound.Port))
+		endSession()
+
+		d.mu.Lock()
+		d.endSession = nil
+		switching := d.switching
+		d.switching = false
+		d.connected = false
+		d.networks = map[string]proto.NetworkInfo{}
+		d.peers = NewPeerTable()
+		if err != nil && !switching {
 			d.lastError = err.Error()
-			d.mu.Unlock()
-		} else {
+		}
+		d.mu.Unlock()
+
+		switch {
+		case switching:
+			d.log.Info("switching to the new server")
+			backoff = time.Second
+			continue
+		case err != nil:
+			d.log.Warn("control connection failed", "err", err)
+		default:
 			// A connection that came up and later dropped is not a reason to
 			// keep backing off.
 			d.log.Warn("control connection closed")
 			backoff = time.Second
 		}
 
-		d.mu.Lock()
-		d.connected = false
-		d.networks = map[string]proto.NetworkInfo{}
-		d.peers = NewPeerTable()
-		d.mu.Unlock()
-
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(backoff):
+		case <-d.configured:
+			backoff = time.Second
+			continue
 		}
 		if backoff < 30*time.Second {
 			backoff *= 2
@@ -200,12 +297,19 @@ func (d *Daemon) Close() {
 // ---------------------------------------------------------------- control ---
 
 func (d *Daemon) controlSession(ctx context.Context, localUDPPort uint16) error {
+	d.mu.Lock()
+	server := d.config.Server
+	d.mu.Unlock()
 	dialer := net.Dialer{Timeout: 15 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", d.config.Server)
+	conn, err := dialer.DialContext(ctx, "tcp", server)
 	if err != nil {
-		return fmt.Errorf("connecting to %s: %w", d.config.Server, err)
+		return fmt.Errorf("connecting to %s: %w", server, err)
 	}
 	defer conn.Close()
+	// Ending the session, for a change of server, closes the connection, which
+	// is what unblocks the reads below.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}

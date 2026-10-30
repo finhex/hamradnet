@@ -134,9 +134,46 @@ Switching between Go and Rust keeps every network, ID and password.
 
 Download it from the [Releases](https://github.com/finhex/hamradnet/releases)
 page, or build it yourself with `./scripts/build-all.sh`, which puts everything
-in `dist/go/` and `dist/rust/`.
+in `dist/go/` and `dist/rust/` (`linux-service/`, `linux-standalone/` and
+`windows/` in each).
 
-### Linux
+### Linux: two ways to run it
+
+The app needs administrator rights to create its network adapter (`hamrad0`).
+There are two downloads that handle that differently. The app inside is the
+same.
+
+| | **Service** (recommended) | **Standalone** |
+|---|---|---|
+| Download | `hamradnet-…-linux-service` | `hamradnet-…-linux-standalone` |
+| Set up | once: `sudo ./install.sh` | nothing |
+| Start | from your app menu, no password | `./run-gui.sh`, password every time |
+| Connection | stays up when you close the app, and starts at boot | ends when you close the app |
+| Remove | **Uninstall HamRadNet** in the app menu | delete the folder |
+
+#### Service
+
+```bash
+sudo ./install.sh
+```
+
+Run that once, inside the unpacked folder. It installs a small background
+service that keeps the tunnel up, adds **HamRadNet** to your app menu, and
+lets HamRadNet traffic through your firewall (ufw or firewalld). From then on,
+open HamRadNet from the menu like any app; it asks for nothing.
+
+- **To upgrade**, or to switch between the Go and Rust versions, run the new
+  download's `install.sh`. Your identity, server and networks are kept.
+- **To remove everything**, including the service and the firewall rule, choose
+  **Uninstall HamRadNet** in the app menu, or run `hamradnet-uninstall`. It
+  keeps your identity and networks in `/etc/hamradnet` for a reinstall;
+  `hamradnet-uninstall --purge` removes those too.
+
+The service also works without the app: `hamradnet connect --server
+203.0.113.45`, `hamradnet status`, `hamradnet logs`, and so on, all as your
+normal user.
+
+#### Standalone
 
 Start it with the launcher next to it:
 
@@ -146,6 +183,14 @@ Start it with the launcher next to it:
 
 From the cloned folder, that is `dist/go/linux/run-gui.sh` or
 `dist/rust/linux/run-gui.sh`.
+
+If your firewall drops incoming traffic, as ufw does by default, let the
+tunnel in once, or you will see your friends' games but not be able to join
+them (and they will not see yours):
+
+```bash
+sudo ufw allow in on hamrad0
+```
 
 **Why it asks for your password:** the app creates a network adapter
 (`hamrad0`), and Linux only lets administrators do that. The launcher asks
@@ -290,9 +335,14 @@ Then go down this list in order:
    falls back to the relay by itself.
 3. **Test the tunnel:** `ping 10.66.x.x` (your friend's address). If that fails,
    it is a HamRadNet problem; restart the app on both sides.
-4. **Ping works, but the game list is empty.** See [Games](#games).
-5. **The game is listed, but joining fails.** Check the host's firewall. On
-   Windows, allow the game for both Private and Public networks.
+4. **Ping works, but one of you cannot see the other's game, or joining
+   fails.** It is almost always a firewall on the side that cannot be reached.
+   A ping still gets through, because firewalls let pings in. On Linux with
+   ufw, `sudo ufw allow in on hamrad0` (the service's `install.sh` does this
+   for you). To see whether ufw is the cause, run `journalctl -k | grep 'UFW
+   BLOCK.*hamrad0'`: each line is a packet from a friend that it threw away.
+   On Windows, allow the game for both Private and Public networks.
+5. **The game list is empty on both sides.** See [Games](#games).
 6. **The app window does not open on Linux.** Start it with `run-gui.sh`, not
    `sudo hamradnet-gui`.
 

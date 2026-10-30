@@ -23,7 +23,28 @@ const (
 		`"last_seen_secs":1,"rtt_ms":23.5,"networks":["HAM-1111-2222"]}]}`
 	rustErrorReply = `{"reply":"error","message":"bad password"}`
 	rustJoin       = `{"token":"t","command":{"cmd":"join_network","network_id":"HAM-1-2","password":"p"}}`
+	rustConfigure  = `{"token":"t","command":{"cmd":"configure","server":"203.0.113.45:7777","name":""}}`
+	rustLogs       = `{"token":"t","command":{"cmd":"logs"}}`
 )
+
+// The app and command line point a service at a server, and fetch its log,
+// with the same two commands in either language.
+func TestDecodesTheServiceCommandsAsRustSendsThem(t *testing.T) {
+	var configure, logs Request
+	if err := json.Unmarshal([]byte(rustConfigure), &configure); err != nil {
+		t.Fatal(err)
+	}
+	if configure.Command != "configure" || configure.Server != "203.0.113.45:7777" || configure.Name != "" {
+		t.Errorf("configure decoded as %+v", configure)
+	}
+	if err := json.Unmarshal([]byte(rustLogs), &logs); err != nil || logs.Command != "logs" {
+		t.Errorf("logs decoded as %+v (%v)", logs, err)
+	}
+	raw, _ := json.Marshal(Request{Token: "t", Command: "configure", Server: "s:1"})
+	if string(raw) != `{"token":"t","command":{"cmd":"configure","server":"s:1"}}` {
+		t.Errorf("configure encoded as %s", raw)
+	}
+}
 
 func TestDecodesWhatTheRustDaemonSends(t *testing.T) {
 	var status Response
@@ -122,6 +143,9 @@ func TestRoundTripsThroughTheWireFormat(t *testing.T) {
 		{Token: "t", Command: "join", NetworkID: "HAM-1-2", Password: "p"},
 		{Token: "t", Command: "leave", NetworkID: "HAM-1-2"},
 		{Token: "t", Command: "delete", NetworkID: "HAM-1-2"},
+		{Token: "t", Command: "configure", Server: "203.0.113.45:7777", Name: "n"},
+		{Token: "t", Command: "configure", Server: "203.0.113.45:7777"},
+		{Token: "t", Command: "logs"},
 	} {
 		raw, _ := json.Marshal(req)
 		var back Request

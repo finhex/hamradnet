@@ -33,6 +33,8 @@ type Request struct {
 	NetworkID string `json:"network_id,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Password  string `json:"password,omitempty"`
+	// Server is for "configure": the coordinator to use from now on.
+	Server string `json:"server,omitempty"`
 }
 
 // Response is the daemon's reply.
@@ -232,6 +234,22 @@ func (d *Daemon) Dispatch(req Request) Response {
 		}
 		return Response{OK: true, Message: "Deleted " + deleted.NetworkID + ". Nobody can join it again."}
 
+	case "configure":
+		if err := d.Configure(req.Server, req.Name); err != nil {
+			return Response{Message: err.Error()}
+		}
+		d.mu.Lock()
+		server, name := d.config.Server, d.config.Name
+		d.mu.Unlock()
+		return Response{OK: true, Message: fmt.Sprintf("Connecting to %s as %s.", server, name)}
+
+	case "logs":
+		if d.logs == nil {
+			return Response{Message: "this daemon keeps no log of its own"}
+		}
+		text, _, _ := d.logs.Snapshot()
+		return Response{OK: true, Message: text}
+
 	default:
 		return Response{Message: "unknown command " + req.Command}
 	}
@@ -306,6 +324,11 @@ func (d *Daemon) ServeIPC() error {
 	if err := SaveEndpoint(path, Endpoint{Port: port, Token: token}); err != nil {
 		return err
 	}
+	if d.ipcOwner != nil {
+		if err := os.Chown(path, d.ipcOwner[0], d.ipcOwner[1]); err != nil {
+			return fmt.Errorf("giving %s to its user: %w", path, err)
+		}
+	}
 	d.log.Info("local control channel ready", "port", port, "path", path)
 
 	for {
@@ -347,7 +370,7 @@ func (d *Daemon) handleIPC(conn net.Conn, token string) {
 // SaveEndpoint writes the endpoint file, owner-only: it holds the token.
 func SaveEndpoint(path string, e Endpoint) error {
 	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}

@@ -51,6 +51,7 @@ else
   cp "$TARGET_DIR/release/hamradnet-gui" "$DIST/linux/"
 fi
 install -m 0755 scripts/run-gui.sh "$DIST/linux/run-gui.sh"
+package_linux "$DIST"
 
 echo "==> Rust, Windows: server, command line and the app"
 ( cd rust && cargo build --release --target "$WINDOWS_TARGET" \

@@ -9,6 +9,11 @@
 # both directions, and finally runs a Warcraft III-style LAN search to
 # 255.255.255.255, which must find the other player with no setup at all.
 #
+# The command lines are crossed throughout: the network is created and joined,
+# the second client is pointed at the server the way the app sets up the
+# background service (it starts with none), and the first client's log is
+# fetched, all with the *other* language's `hamradnet`.
+#
 # The first client to connect gets the lower peer ID, and the lower ID starts
 # the encrypted handshake, so Go+Rust and Rust+Go between them cover each
 # language on each side of it.
@@ -108,12 +113,14 @@ cli() {
     in_ns "$ns" timeout 20 "$bin/hamradnet" "$@"
 }
 
+# start_client <ns> <impl> <name> [up flags...]: start a client's daemon. With
+# no flags it is given the server up front.
 start_client() {
-  local ns=$1 bin; bin="$(bin_for "$2")"; local dir="$RUN/$3"
+  local ns=$1 bin; bin="$(bin_for "$2")"; local dir="$RUN/$3" name=$3; shift 3
+  (( $# )) || set -- --server "$SERVER_ADDR" --name "$name"
   mkdir -p "$dir"
   HAMRADNET_CONFIG="$dir/config.json" HAMRADNET_IPC="$dir/ipc.json" \
-    in_ns "$ns" "$bin/hamradnet" up --server "$SERVER_ADDR" --name "$3" \
-    > "$dir/daemon.log" 2>&1 &
+    in_ns "$ns" "$bin/hamradnet" up "$@" > "$dir/daemon.log" 2>&1 &
   CASE_PIDS+=($!)
 }
 
@@ -247,9 +254,18 @@ run_case() {
       | tee "$RUN/create.out" | grep -oE 'HAM-[0-9]{4}-[0-9]{4}' | head -1)"
     [[ -n $network_id ]] || result=FAIL detail="creating a network failed: $(tr '\n' ' ' < "$RUN/create.out")"
   fi
+  # B starts the way the installed service does, with no server, and is pointed
+  # at one afterwards by the other language's `connect`, as the app does.
   if [[ -z $result ]]; then
-    start_client "$NS_B" "$b" "$name_b"
-    if ! addr_b="$(wait_connected "$NS_B" "$b" "$name_b")"; then
+    start_client "$NS_B" "$b" "$name_b" --ipc-user root
+    for _ in $(seq 1 40); do
+      [[ -f "$RUN/$name_b/ipc.json" ]] && break
+      sleep 0.1
+    done
+    if ! cli "$NS_B" "$(other "$b")" "$name_b" connect --server 10.99.1.1 --name "$name_b" \
+         > "$RUN/connect.out" 2>&1; then
+      result=FAIL detail="pointing B at the server failed: $(tr '\n' ' ' < "$RUN/connect.out")"
+    elif ! addr_b="$(wait_connected "$NS_B" "$b" "$name_b")"; then
       result=FAIL detail="client B ($b) never connected to the $server server"
     elif ! cli "$NS_B" "$(other "$b")" "$name_b" join "$network_id" --password "$password" > "$RUN/join.out" 2>&1; then
       result=FAIL detail="joining failed: $(tr '\n' ' ' < "$RUN/join.out")"
@@ -299,15 +315,18 @@ run_case() {
     done
     cli "$NS_A" "$(other "$a")" "$name_a" status > "$RUN/status-other.out" 2>&1 || true
     cli "$NS_A" "$(other "$a")" "$name_a" peers > "$RUN/peers-other.out" 2>&1 || true
+    cli "$NS_A" "$(other "$a")" "$name_a" logs > "$RUN/logs-other.out" 2>&1 || true
     if [[ "$path_seen" != "$path" ]]; then
       result=FAIL detail="traffic flowed, but A reports the path as '${path_seen:-unknown}', expected $path"
     elif ! grep -qE "^address *: *$addr_a\$" "$RUN/status-other.out"; then
       result=FAIL detail="the $(other "$a") CLI could not read A's status: $(tr '\n' ' ' < "$RUN/status-other.out")"
     elif ! grep -qF "$name_b" "$RUN/peers-other.out"; then
       result=FAIL detail="the $(other "$a") CLI could not list A's peers: $(tr '\n' ' ' < "$RUN/peers-other.out")"
+    elif ! grep -q 'connected to coordinator' "$RUN/logs-other.out"; then
+      result=FAIL detail="the $(other "$a") CLI could not fetch A's log: $(head -c 200 "$RUN/logs-other.out")"
     else
       result=PASS
-      detail="ping ${rtt} ms, ${loss}% loss; TCP A→B ${rate_ab} MB/s, B→A ${rate_ba} MB/s; LAN search found B"
+      detail="ping ${rtt} ms, ${loss}% loss; TCP A→B ${rate_ab} MB/s, B→A ${rate_ba} MB/s; LAN search; service commands"
     fi
   fi
 

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use hamradnet_proto::DEFAULT_CONTROL_PORT;
 use serde::{Deserialize, Serialize};
 
 use crate::session::NOISE_PARAMS;
@@ -104,6 +105,28 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Tidies a server address as typed, adding the default port if there is none,
+/// since a bare IP is what people have to hand. Matches the Go client's
+/// `NormalizeServer`.
+pub fn normalize_server(server: &str) -> String {
+    let server = server.trim();
+    if server.is_empty() || server.parse::<std::net::SocketAddr>().is_ok() {
+        return server.to_string();
+    }
+    // A name with a port, such as vpn.example.com:7777.
+    if let Some((host, port)) = server.rsplit_once(':') {
+        if !host.contains(':') && port.parse::<u16>().is_ok() {
+            return server.to_string();
+        }
+    }
+    let host = server.trim_start_matches('[').trim_end_matches(']');
+    if host.contains(':') {
+        format!("[{host}]:{DEFAULT_CONTROL_PORT}")
+    } else {
+        format!("{host}:{DEFAULT_CONTROL_PORT}")
+    }
+}
+
 /// `$HAMRADNET_CONFIG` wins; otherwise a system-wide location, since the daemon
 /// needs elevated privileges to create the tunnel interface anyway.
 pub fn default_config_path() -> PathBuf {
@@ -196,6 +219,23 @@ mod tests {
             let config: Config = serde_json::from_str(&text)
                 .unwrap_or_else(|err| panic!("{text} did not load: {err}"));
             assert!(config.networks.is_empty());
+        }
+    }
+
+    #[test]
+    fn server_addresses_get_the_default_port() {
+        for (typed, want) in [
+            ("203.0.113.45", "203.0.113.45:7777"),
+            (" 203.0.113.45 ", "203.0.113.45:7777"),
+            ("203.0.113.45:9000", "203.0.113.45:9000"),
+            ("vpn.example.com", "vpn.example.com:7777"),
+            ("vpn.example.com:7777", "vpn.example.com:7777"),
+            ("2001:db8::1", "[2001:db8::1]:7777"),
+            ("[2001:db8::1]", "[2001:db8::1]:7777"),
+            ("[2001:db8::1]:7777", "[2001:db8::1]:7777"),
+            ("", ""),
+        ] {
+            assert_eq!(normalize_server(typed), want, "for {typed:?}");
         }
     }
 

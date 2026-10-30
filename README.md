@@ -37,6 +37,14 @@ Every program exists twice, once written in Go and once in Rust:
 | Source | `go/` | `rust/` |
 | Built programs | `dist/go/` | `dist/rust/` |
 | Windows zip for friends | `dist/go/hamradnet-go-windows.zip` | `dist/rust/hamradnet-rust-windows.zip` |
+| Linux app, as a service | `dist/go/linux-service/` | `dist/rust/linux-service/` |
+| Linux app, standalone | `dist/go/linux-standalone/` | `dist/rust/linux-standalone/` |
+
+On Linux the **service** version is the comfortable one: `sudo ./install.sh`
+once, then HamRadNet starts from your app menu with no password. The
+**standalone** version asks for your password every time you start it with
+`run-gui.sh`. The two Linux folders hold the same app; see
+[Getting it running](#getting-it-running).
 
 Both speak the same protocol, so **mix them freely**. A Go app connects to a
 Rust server, a Rust app tunnels to a Go app, and either command line controls
@@ -93,8 +101,8 @@ which one is running:
 
 ```bash
 ssh root@203.0.113.45 hamradnet-server --version
-#   hamradnet-server 0.3.0-go   → Go (the Go version always ends in -go)
-#   hamradnet-server 0.3.0      → Rust
+#   hamradnet-server 0.4.0-go   → Go (the Go version always ends in -go)
+#   hamradnet-server 0.4.0      → Rust
 ```
 
 **An IP address is all you need** — no domain name, no DNS, no certificates.
@@ -164,17 +172,34 @@ the same folder. Right-click the exe and choose **Run as administrator**.
 Windows only lets administrators create a network adapter, and the app tells
 you so in plain words if you forget.
 
-**Linux.** Start it with the launcher next to it, for the same reason:
+**Linux** needs root for the same reason, and comes two ways. The app is the
+same in both.
 
-```bash
-dist/go/linux/run-gui.sh       # the Go app
-dist/rust/linux/run-gui.sh     # the Rust app
-```
+- **Service** (`linux-service/`, recommended). Run `sudo ./install.sh` once.
+  It installs a background service that holds the tunnel and starts at boot,
+  adds HamRadNet to the app menu, and opens `hamrad0` in ufw or firewalld.
+  After that the app runs from the menu as your normal user, with no
+  password, and talks to the service over the same local channel the command
+  line uses. **Uninstall HamRadNet** in the menu, or `hamradnet-uninstall`,
+  removes the service, the programs, the menu entries and the firewall rule.
+  `--purge` also removes your identity and networks in `/etc/hamradnet`.
+- **Standalone** (`linux-standalone/`). Start it with the launcher next to it,
+  which asks for your password every time:
 
-Not `sudo hamradnet-gui`. `sudo` drops the settings that let the app reach
-your screen. The launcher asks for your password (through `sudo`, or `pkexec`
-where there is no `sudo`), keeps the display, and draws the window through X11,
-or XWayland on a Wayland desktop, which looks the same.
+  ```bash
+  dist/go/linux/run-gui.sh       # the Go app
+  dist/rust/linux/run-gui.sh     # the Rust app
+  ```
+
+  Not `sudo hamradnet-gui`. `sudo` drops the settings that let the app reach
+  your screen. The launcher asks for your password (through `sudo`, or
+  `pkexec` where there is no `sudo`), keeps the display, and draws the window
+  through X11, or XWayland on a Wayland desktop, which looks the same. If ufw
+  is on, run `sudo ufw allow in on hamrad0` once, or your friends' games
+  stay invisible and yours cannot be joined.
+
+The app always looks for a running service first, so the two never fight over
+the tunnel.
 
 The apps run on any 64-bit Linux from about 2018 on (glibc 2.28 or newer); both
 were tested on Debian 11. See [What it runs on](GUIDE.md#what-it-runs-on).
@@ -356,7 +381,9 @@ the firewall or the port.
 
 | Command | What it does |
 |---|---|
-| `hamradnet up --server HOST:PORT --name NAME` | Run the daemon. Root/Administrator. |
+| `hamradnet up --server HOST:PORT --name NAME` | Run the daemon. Root/Administrator. Both flags may be left out, as the service does; it then waits for `connect`. `--ipc-user NAME` lets that user drive it. |
+| `hamradnet connect --server HOST [--name NAME]` | Point the running daemon at a server, as the app's Connect button does. Port 7777 is assumed. |
+| `hamradnet logs` | The running daemon's recent log. |
 | `hamradnet create NAME --password PW` | Make a network and join it. |
 | `hamradnet join ID --password PW` | Join someone's network. |
 | `hamradnet leave ID` | Leave, and stop rejoining at startup. |
@@ -490,11 +517,20 @@ rust/                  the Rust version (a Cargo workspace)
   crates/server        coordinator
   crates/client        daemon and CLI, with the tun device per platform
   crates/gui           the desktop app
-deploy/                systemd units, shared by both versions
+deploy/                the server's systemd unit, shared by both versions
 scripts/               build-*.sh, deploy-vps.sh, install-server.sh,
-                       run-gui.sh, interop-test.sh
-dist/go/, dist/rust/   built programs (made by the build scripts)
+                       run-gui.sh, install-service.sh, interop-test.sh
+dist/go/, dist/rust/   built programs (made by the build scripts):
+  linux/               every Linux program, the server too
+  linux-service/       the app + install.sh (from install-service.sh)
+  linux-standalone/    the app + run-gui.sh
+  windows/             the Windows programs and wintun.dll
 ```
+
+On Linux the app either runs the daemon inside itself, which needs root, or
+drives the background service over the local control channel. It decides at
+startup by asking whether a daemon answers on `ipc.json`, which the service
+gives to the installing user with `up --ipc-user`.
 
 In both versions the app and the CLI are the same daemon with different front
 ends. The GUI holds a `Daemon` handle directly and calls the same command

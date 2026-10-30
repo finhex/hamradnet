@@ -8,6 +8,7 @@ pub mod framing;
 pub mod ip;
 pub mod ipc;
 pub mod ipc_server;
+pub mod logs;
 pub mod peers;
 pub mod session;
 pub mod tun;

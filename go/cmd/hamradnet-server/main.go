@@ -23,7 +23,7 @@ import (
 
 // version is stamped at build time with -ldflags "-X main.version=..."; the
 // default keeps `--version` honest in a plain `go build`.
-var version = "0.3.0-go"
+var version = "0.4.0-go"
 
 // graceFlag takes plain seconds, as the Rust server's --empty-grace does, so one
 // command line or systemd unit works for either server. A Go duration such as

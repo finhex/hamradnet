@@ -5,12 +5,12 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use hamradnet::config::{default_config_path, encode_key, ipc_path, Config};
+use hamradnet::config::{default_config_path, encode_key, ipc_path, normalize_server, Config};
 use hamradnet::daemon;
 use hamradnet::ipc::{self, Command, Response};
+use hamradnet::logs::LogBuffer;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,7 +40,23 @@ enum Commands {
         /// Local UDP port. 0 lets the OS choose.
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Let this user's app and command line control the daemon, for
+        /// running it as a service.
+        #[arg(long)]
+        ipc_user: Option<String>,
     },
+    /// Point the running daemon at a server; the command-line twin of the
+    /// app's Connect button.
+    Connect {
+        /// The server's address. Port 7777 is assumed.
+        #[arg(long)]
+        server: String,
+        /// The name your friends see. Unchanged if not given.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show the running daemon's recent log.
+    Logs,
     /// Create a new network and join it.
     Create {
         /// A name for the network, for display only.
@@ -80,7 +96,13 @@ async fn main() -> Result<()> {
     let config_path = cli.config.clone().unwrap_or_else(default_config_path);
 
     match cli.command {
-        Commands::Up { server, name, port } => run_daemon(config_path, server, name, port).await,
+        Commands::Up { server, name, port, ipc_user } => {
+            run_daemon(config_path, server, name, port, ipc_user).await
+        }
+        Commands::Connect { server, name } => {
+            call(Command::Configure { server, name: name.unwrap_or_default() }).await
+        }
+        Commands::Logs => call(Command::Logs).await,
         Commands::Create { name, password } => {
             call(Command::CreateNetwork { name, password }).await
         }
@@ -113,16 +135,22 @@ async fn run_daemon(
     server: Option<String>,
     name: Option<String>,
     port: u16,
+    ipc_user: Option<String>,
 ) -> Result<()> {
-    // Colour only for a terminal: under systemd or in a file it would land as
-    // escape codes.
+    // The log goes to stderr and also into a buffer the app can fetch, since a
+    // service's output otherwise only reaches the system journal. Plain text,
+    // as escape codes would land in both.
+    let logs = LogBuffer::default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "hamradnet=info".into()),
         )
-        .with_ansi(std::io::stdout().is_terminal())
+        .with_writer(logs.clone())
+        .with_ansi(false)
         .init();
+    let ipc_owner = ipc_user.as_deref().map(lookup_user).transpose()?;
+    let server = server.map(|server| normalize_server(&server)).filter(|s| !s.is_empty());
 
     let config = match Config::load(&config_path) {
         Ok(mut existing) => {
@@ -146,13 +174,12 @@ async fn run_daemon(
             existing
         }
         Err(_) => {
-            // First run: an identity key is generated and kept from here on.
-            let server = server.context(
-                "no configuration yet - pass --server host:port (and optionally --name) \
-                 the first time you run `hamradnet up`",
-            )?;
-            let name = name.unwrap_or_else(default_name);
-            let config = Config::generate(server, name)?;
+            // First run: an identity key is generated and kept from here on. With
+            // no server yet, as when started as a service, the daemon waits for
+            // one.
+            // A service runs as root, so the user it serves names it.
+            let name = name.or(ipc_user).unwrap_or_else(default_name);
+            let config = Config::generate(server.unwrap_or_default(), name)?;
             config.save(&config_path)?;
             tracing::info!(path = %config_path.display(), "created a new configuration");
             config
@@ -166,7 +193,24 @@ async fn run_daemon(
         "starting hamradnet"
     );
 
-    daemon::run(config, config_path, port).await
+    daemon::run(config, config_path, port, daemon::Options { logs: Some(logs), ipc_owner }).await
+}
+
+/// The `(uid, gid)` of a user, for `--ipc-user`.
+#[cfg(unix)]
+fn lookup_user(name: &str) -> Result<(u32, u32)> {
+    let c_name = std::ffi::CString::new(name)?;
+    // getpwnam returns static storage, read straight away and not kept.
+    let entry = unsafe { libc::getpwnam(c_name.as_ptr()) };
+    if entry.is_null() {
+        anyhow::bail!("--ipc-user: there is no user named {name}");
+    }
+    Ok(unsafe { ((*entry).pw_uid, (*entry).pw_gid) })
+}
+
+#[cfg(not(unix))]
+fn lookup_user(_name: &str) -> Result<(u32, u32)> {
+    anyhow::bail!("--ipc-user is only used on Linux")
 }
 
 fn default_name() -> String {

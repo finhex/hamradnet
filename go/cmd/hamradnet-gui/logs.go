@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -12,48 +11,28 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// logKeep is how many recent log lines the app holds for the log window. Older
-// ones are dropped; the terminal still has everything.
-const logKeep = 2000
-
-// logBuffer keeps the most recent log lines so the app can show them, and copy
-// them for whoever is helping when something goes wrong. It sits beside
-// stderr as a second destination for the same log.
-type logBuffer struct {
-	mu    sync.Mutex
-	lines []string
-	// added counts every line ever written, so a viewer can tell whether
-	// anything is new even once old lines start being dropped.
-	added int
-}
-
-// Write takes one log record; slog writes each in a single call.
-func (b *logBuffer) Write(p []byte) (int, error) {
-	text := strings.TrimRight(string(p), "\n")
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, line := range strings.Split(text, "\n") {
-		b.lines = append(b.lines, line)
-		b.added++
-	}
-	if extra := len(b.lines) - logKeep; extra > 0 {
-		b.lines = append(b.lines[:0:0], b.lines[extra:]...)
-	}
-	return len(p), nil
-}
-
-// Snapshot returns the lines held, and the running count they end at.
-func (b *logBuffer) Snapshot() (string, int, int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return strings.Join(b.lines, "\n"), len(b.lines), b.added
-}
-
 func lines(n int) string {
 	if n == 1 {
 		return "1 line"
 	}
 	return fmt.Sprintf("%d lines", n)
+}
+
+func countLines(text string) int {
+	if text == "" {
+		return 0
+	}
+	return strings.Count(text, "\n") + 1
+}
+
+// logText is the log of whatever runs the tunnel: the service's own while the
+// app drives it, otherwise this app's, which includes a tunnel run in-process.
+func (u *ui) logText() (string, error) {
+	if b := u.current(); b != nil && b.Service() {
+		return b.Log()
+	}
+	text, _, _ := u.logs.Snapshot()
+	return text, nil
 }
 
 // showLogs opens the log in a window of its own, so it can sit beside the main
@@ -73,31 +52,34 @@ func (u *ui) showLogs() {
 	scroll := container.NewScroll(text)
 	info := widget.NewLabel("")
 
-	shown := -1
-	update := func() {
-		body, count, added := u.logs.Snapshot()
-		if added == shown {
+	shown, first := "", true
+	show := func(body string, err error) {
+		if err != nil {
+			info.SetText("Could not fetch the log: " + err.Error())
+			return
+		}
+		if body == shown && !first {
 			return
 		}
 		// Follow new lines only while the reader is at the bottom; someone who
 		// scrolled up to read something must not be yanked away from it.
 		bottom := scroll.Content.MinSize().Height - scroll.Size().Height
-		following := shown < 0 || scroll.Offset.Y >= bottom-theme.Padding()
-		shown = added
+		following := first || scroll.Offset.Y >= bottom-theme.Padding()
+		shown, first = body, false
 		if body == "" {
-			body = "Nothing logged yet."
+			text.SetText("Nothing logged yet.")
+		} else {
+			text.SetText(body)
 		}
-		text.SetText(body)
-		info.SetText(lines(count))
+		info.SetText(lines(countLines(body)))
 		if following {
 			scroll.ScrollToBottom()
 		}
 	}
 
 	copyAll := widget.NewButton("Copy all", func() {
-		body, count, _ := u.logs.Snapshot()
-		window.Clipboard().SetContent(body)
-		info.SetText(fmt.Sprintf("Copied %s to the clipboard", lines(count)))
+		window.Clipboard().SetContent(shown)
+		info.SetText(fmt.Sprintf("Copied %s to the clipboard", lines(countLines(shown))))
 	})
 	copyAll.Importance = widget.HighImportance
 
@@ -114,9 +96,11 @@ func (u *ui) showLogs() {
 		u.logWindow = nil
 	})
 	u.logWindow = window
-	update()
+	show(u.logText())
 	window.Show()
 
+	// Fetching the service's log is a request over the local control channel,
+	// so it happens here rather than on the UI thread.
 	go func() {
 		ticker := time.NewTicker(refresh)
 		defer ticker.Stop()
@@ -125,7 +109,8 @@ func (u *ui) showLogs() {
 			case <-stop:
 				return
 			case <-ticker.C:
-				fyne.Do(update)
+				body, err := u.logText()
+				fyne.Do(func() { show(body, err) })
 			}
 		}
 	}()

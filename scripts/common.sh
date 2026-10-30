@@ -38,6 +38,23 @@ package_windows() {
   echo "==> Packaged $dist/$name.zip"
 }
 
+# The Linux app comes two ways, made from the same programs:
+#   linux-standalone/  started with run-gui.sh, which asks for the password
+#                      each time
+#   linux-service/     set up once with install.sh as a background service,
+#                      after which the app runs from the menu with no password
+# dist/*/linux/ keeps every Linux program, the server too, for the scripts.
+package_linux() {
+  local dist="$1" variant
+  for variant in linux-standalone linux-service; do
+    rm -rf "${dist:?}/$variant"
+    mkdir -p "$dist/$variant"
+    cp "$dist/linux/hamradnet" "$dist/linux/hamradnet-gui" "$dist/$variant/"
+  done
+  install -m 0755 scripts/run-gui.sh "$dist/linux-standalone/run-gui.sh"
+  install -m 0755 scripts/install-service.sh "$dist/linux-service/install.sh"
+}
+
 list_built() {
   echo
   echo "Built:"

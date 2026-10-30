@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/common.sh
 DIST=dist/go
-LDFLAGS="-s -w -X main.version=0.3.0-go"
+LDFLAGS="-s -w -X main.version=0.4.0-go"
 GLIBC=2.28
 
 rm -rf "$DIST"
@@ -64,6 +64,7 @@ else
   )
 fi
 install -m 0755 scripts/run-gui.sh "$DIST/linux/run-gui.sh"
+package_linux "$DIST"
 
 echo "==> Go, Windows: server and command line"
 ( cd go

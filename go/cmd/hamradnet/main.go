@@ -9,17 +9,20 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"os/user"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/finhex/hamradnet/internal/client"
 )
 
-var version = "0.3.0-go"
+var version = "0.4.0-go"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -48,6 +51,10 @@ func main() {
 		err = runPeers()
 	case "check":
 		err = runCheck(args)
+	case "connect":
+		err = runConnect(args)
+	case "logs":
+		err = call(client.Request{Command: "logs"})
 	case "key":
 		err = runKey()
 	case "version", "--version", "-v":
@@ -70,6 +77,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `hamradnet - a virtual LAN for playing games with friends
 
   up --server HOST:PORT --name NAME   run the daemon (needs root/Administrator)
+  connect --server HOST [--name NAME] point the running daemon at a server
   create NAME --password PW           make a network and join it
   join ID --password PW               join somebody's network
   leave ID                            leave, keeping the network for others
@@ -77,10 +85,12 @@ func usage() {
   status                              connection state and your address
   peers                               everyone reachable, and how
   check --server HOST:PORT            test a server's TCP and UDP (no root needed)
+  logs                                the running daemon's recent log
   key                                 this machine's public key
 
 The daemon remembers the networks you joined and rejoins them at startup, so
-`+"`up`"+` is normally all you need after the first time.
+`+"`up`"+` is normally all you need after the first time. Run as a service, it
+may start with no server at all; `+"`connect`"+` or the app then chooses one.
 `)
 }
 
@@ -91,18 +101,27 @@ func runDaemon(args []string) error {
 	port := fs.Int("port", 0, "local UDP port, 0 lets the OS choose")
 	configPath := fs.String("config", client.DefaultConfigPath(), "path to the config file")
 	iface := fs.String("interface", client.InterfaceName, "name of the tunnel interface to create")
+	ipcUser := fs.String("ipc-user", "", "let this user's app and command line control the daemon "+
+		"(for running it as a service)")
 	_ = fs.Parse(args)
+	*server = client.NormalizeServer(*server)
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel()}))
+	// The log also goes into a buffer the app can fetch, since a service's
+	// output otherwise only reaches the system journal.
+	logs := &client.LogBuffer{}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs),
+		&slog.HandlerOptions{Level: logLevel()}))
 
 	config, err := client.LoadConfig(*configPath)
 	if err != nil {
-		// First run: an identity key is generated and kept from here on.
-		if *server == "" {
-			return errors.New("no configuration yet - pass --server host:port " +
-				"(and optionally --name) the first time you run `hamradnet up`")
+		// First run: an identity key is generated and kept from here on. With no
+		// server yet, as when started as a service, the daemon waits for one.
+		// A service runs as root, so the user it serves names it, not "root".
+		first := *name
+		if first == "" {
+			first = *ipcUser
 		}
-		config, err = client.GenerateConfig(*server, defaultName(*name))
+		config, err = client.GenerateConfig(*server, defaultName(first))
 		if err != nil {
 			return err
 		}
@@ -135,6 +154,16 @@ func runDaemon(args []string) error {
 
 	daemon := client.NewDaemon(config, *configPath, log)
 	daemon.SetInterfaceName(*iface)
+	daemon.SetLogBuffer(logs)
+	if *ipcUser != "" {
+		owner, err := user.Lookup(*ipcUser)
+		if err != nil {
+			return fmt.Errorf("--ipc-user: %w", err)
+		}
+		uid, _ := strconv.Atoi(owner.Uid)
+		gid, _ := strconv.Atoi(owner.Gid)
+		daemon.SetIPCOwner(uid, gid)
+	}
 	defer daemon.Close()
 
 	go func() {
@@ -146,6 +175,19 @@ func runDaemon(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	return daemon.Run(ctx, *port)
+}
+
+// runConnect points a running daemon at a server, the command-line twin of the
+// app's Connect button.
+func runConnect(args []string) error {
+	fs := flag.NewFlagSet("connect", flag.ExitOnError)
+	server := fs.String("server", "", "the server's address; port 7777 is assumed")
+	name := fs.String("name", "", "the name your friends see (unchanged if not given)")
+	_ = fs.Parse(args)
+	if *server == "" {
+		return errors.New("usage: connect --server HOST[:PORT] [--name NAME]")
+	}
+	return call(client.Request{Command: "configure", Server: *server, Name: *name})
 }
 
 func runCreate(args []string) error {

@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"image/color"
 	"io"
 	"log/slog"
 	"os"
@@ -26,25 +27,23 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/finhex/hamradnet/internal/client"
-	"github.com/finhex/hamradnet/internal/proto"
 )
 
 // refresh is how often the window redraws, so peer state looks live.
 const refresh = time.Second
 
-var version = "0.3.0-go"
+var version = "0.4.0-go"
 
 type ui struct {
 	window fyne.Window
 	log    *slog.Logger
 	// logs holds recent log lines for the log window; logWindow is that window
 	// while it is open.
-	logs      *logBuffer
+	logs      *client.LogBuffer
 	logWindow fyne.Window
 
 	mu         sync.Mutex
-	daemon     *client.Daemon
-	cancel     context.CancelFunc
+	backend    backend
 	configPath string
 
 	// Setup screen.
@@ -53,6 +52,8 @@ type ui struct {
 	setupError  *widget.Label
 
 	// Main screen.
+	// statusDot is drawn rather than written: the bundled font has no "●".
+	statusDot   *canvas.Circle
 	statusLabel *widget.Label
 	addressText *widget.Label
 	content     *fyne.Container
@@ -86,7 +87,7 @@ session's display to draw the window.
 
 	// Everything logged goes to the terminal as before, and is also kept for the
 	// app's own log window.
-	logs := &logBuffer{}
+	logs := &client.LogBuffer{}
 	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs),
 		&slog.HandlerOptions{Level: slog.LevelInfo}))
 	log.Info("starting HamRadNet", "version", version, "os", runtime.GOOS)
@@ -123,6 +124,7 @@ func (u *ui) build() {
 	u.setupError = widget.NewLabel("")
 	u.setupError.Wrapping = fyne.TextWrapWord
 
+	u.statusDot = canvas.NewCircle(connectingColor)
 	u.statusLabel = widget.NewLabel("")
 	u.addressText = widget.NewLabel("")
 	u.notice = widget.NewLabel("")
@@ -132,14 +134,33 @@ func (u *ui) build() {
 	u.content = container.NewStack()
 	u.window.SetContent(u.content)
 
-	// Already set up from a previous run: connect without asking again.
-	if err == nil && client.IsElevated() {
+	switch svc := findService(); {
+	case svc != nil:
+		// The tunnel already runs as a service: drive that, with no root needed.
+		u.log.Info("found the HamRadNet service; this app controls it")
+		u.backend = svc
+		status, _ := svc.Status()
+		u.nameEntry.SetText(status.Name)
+		if status.Server == "" {
+			u.showSetup()
+		} else {
+			u.serverEntry.SetText(status.Server)
+			u.showMain()
+		}
+	case err == nil && client.IsElevated():
+		// Already set up from a previous run: connect without asking again.
 		u.showMain()
 		u.connect()
-	} else {
+	default:
 		u.showSetup()
 	}
 	go u.refreshLoop()
+}
+
+// isService reports whether this app is driving the background service.
+func (u *ui) isService() bool {
+	b := u.current()
+	return b != nil && b.Service()
 }
 
 func (u *ui) showSetup() {
@@ -159,7 +180,10 @@ func (u *ui) showSetup() {
 		container.NewCenter(widget.NewLabel("A private LAN for playing games with friends.")),
 		widget.NewSeparator(),
 	}
-	if !client.IsElevated() {
+	if u.isService() {
+		items = append(items, widget.NewLabel(
+			"HamRadNet runs as a service on this computer. Choose a server to connect it to."))
+	} else if !client.IsElevated() {
 		items = append(items, elevationWarning())
 	}
 	items = append(items,
@@ -178,7 +202,9 @@ func (u *ui) showSetup() {
 
 func (u *ui) showMain() {
 	header := container.NewBorder(nil, nil,
-		container.NewHBox(u.statusLabel, u.addressText),
+		container.NewHBox(
+			container.NewCenter(container.NewGridWrap(fyne.NewSize(10, 10), u.statusDot)),
+			u.statusLabel, u.addressText),
 		container.NewHBox(
 			widget.NewButton("Log", func() { u.showLogs() }),
 			widget.NewButton("Change server", func() { u.disconnect() }),
@@ -209,7 +235,9 @@ func (u *ui) showMain() {
 }
 
 func elevationWarning() fyne.CanvasObject {
-	what := "Close it and start it again with the run-gui.sh launcher, which asks for root."
+	what := "Close it and start it again with the run-gui.sh launcher, which asks for root, " +
+		"or install the HamRadNet service once (install.sh in the service download), " +
+		"after which the app needs no password."
 	if runtime.GOOS == "windows" {
 		what = "Close it, right-click hamradnet-gui.exe and choose \"Run as administrator\"."
 	}
@@ -220,21 +248,30 @@ func elevationWarning() fyne.CanvasObject {
 	return container.NewVBox(title, detail, widget.NewSeparator())
 }
 
-// connect creates or updates the config, then starts the daemon in this process.
+// connect points the service at the chosen server, or, with no service, creates
+// or updates the config and starts the daemon in this process.
 func (u *ui) connect() {
-	server := strings.TrimSpace(u.serverEntry.Text)
+	// A bare IP is the common case, so the port is filled in rather than making
+	// people remember it.
+	server := client.NormalizeServer(u.serverEntry.Text)
 	if server == "" {
 		u.setupError.SetText("Enter your server's address first.")
 		return
 	}
-	// A bare IP is the common case, so fill the port in rather than making
-	// people remember it.
-	if !strings.Contains(server, ":") {
-		server = fmt.Sprintf("%s:%d", server, proto.DefaultControlPort)
-	}
 	name := strings.TrimSpace(u.nameEntry.Text)
 	if name == "" {
 		name = defaultName()
+	}
+
+	if u.isService() {
+		resp := u.current().Do(client.Request{Command: "configure", Server: server, Name: name})
+		if !resp.OK {
+			u.setupError.SetText(resp.Message)
+			return
+		}
+		u.setupError.SetText("")
+		u.showMain()
+		return
 	}
 
 	config, err := client.LoadConfig(u.configPath)
@@ -253,10 +290,11 @@ func (u *ui) connect() {
 	}
 
 	daemon := client.NewDaemon(config, u.configPath, u.log)
+	daemon.SetLogBuffer(u.logs)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	u.mu.Lock()
-	u.daemon, u.cancel = daemon, cancel
+	u.backend = &embedded{daemon: daemon, cancel: cancel, logs: u.logs}
 	u.mu.Unlock()
 
 	go func() {
@@ -274,55 +312,77 @@ func (u *ui) connect() {
 	u.showMain()
 }
 
-// disconnect stops the tunnel and returns to the setup screen, so the server can
-// be changed without restarting.
+// disconnect returns to the setup screen so the server can be changed without
+// restarting. A tunnel in this process is stopped; the service keeps running
+// until it is given the new server.
 func (u *ui) disconnect() {
-	u.shutdown()
-	if config, err := client.LoadConfig(u.configPath); err == nil {
-		u.serverEntry.SetText(config.Server)
-		u.nameEntry.SetText(config.Name)
+	if u.isService() {
+		if status, err := u.current().Status(); err == nil {
+			u.serverEntry.SetText(status.Server)
+			u.nameEntry.SetText(status.Name)
+		}
+	} else {
+		u.shutdown()
+		if config, err := client.LoadConfig(u.configPath); err == nil {
+			u.serverEntry.SetText(config.Server)
+			u.nameEntry.SetText(config.Name)
+		}
 	}
 	u.notice.SetText("")
 	u.showSetup()
 }
 
+// shutdown stops a tunnel running in this process. The service is left alone:
+// closing the app does not take anyone off the network.
 func (u *ui) shutdown() {
 	u.mu.Lock()
-	cancel, daemon := u.cancel, u.daemon
-	u.cancel, u.daemon = nil, nil
-	u.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	b := u.backend
+	if b != nil && !b.Service() {
+		u.backend = nil
 	}
-	if daemon != nil {
-		daemon.Close()
+	u.mu.Unlock()
+	if b != nil && !b.Service() {
+		b.Close()
 	}
 }
 
-func (u *ui) current() *client.Daemon {
+func (u *ui) current() backend {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return u.daemon
+	return u.backend
 }
 
 func (u *ui) refreshLoop() {
 	for range time.Tick(refresh) {
-		daemon := u.current()
-		if daemon == nil {
+		b := u.current()
+		if b == nil {
 			continue
 		}
-		status := daemon.Status()
-		peers := daemon.PeerReports()
+		status, err := b.Status()
+		if err != nil {
+			fyne.Do(func() { u.notice.SetText("The HamRadNet service is not answering: " + err.Error()) })
+			continue
+		}
+		peers, _ := b.Peers()
 		fyne.Do(func() { u.render(status, peers) })
 	}
 }
 
+var (
+	connectedColor  = color.NRGBA{R: 70, G: 190, B: 120, A: 255}
+	connectingColor = color.NRGBA{R: 220, G: 160, B: 60, A: 255}
+)
+
 func (u *ui) render(status client.Status, peers []client.PeerReport) {
-	state := "Connecting…"
+	state, dot := "Connecting…", connectingColor
 	if status.Connected {
-		state = "Connected"
+		state, dot = "Connected", connectedColor
 	}
-	u.statusLabel.SetText(fmt.Sprintf("● %s · %s", state, status.Server))
+	if u.statusDot.FillColor != dot {
+		u.statusDot.FillColor = dot
+		u.statusDot.Refresh()
+	}
+	u.statusLabel.SetText(fmt.Sprintf("%s · %s", state, status.Server))
 	if status.VirtualIP != "" {
 		u.addressText.SetText("   Your address: " + status.VirtualIP)
 	}
@@ -504,13 +564,13 @@ func (u *ui) confirmDelete(id, name string) {
 // send runs a command off the UI thread, so a slow coordinator cannot freeze the
 // window, and reports the outcome when it comes back.
 func (u *ui) send(req client.Request) {
-	daemon := u.current()
-	if daemon == nil {
+	b := u.current()
+	if b == nil {
 		return
 	}
 	u.notice.SetText("Working…")
 	go func() {
-		resp := daemon.Dispatch(req)
+		resp := b.Do(req)
 		message := resp.Message
 		if message == "" && resp.OK {
 			message = "Done."
