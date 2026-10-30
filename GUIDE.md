@@ -343,8 +343,13 @@ Then go down this list in order:
    BLOCK.*hamrad0'`: each line is a packet from a friend that it threw away.
    On Windows, allow the game for both Private and Public networks.
 5. **The game list is empty on both sides.** See [Games](#games).
-6. **The app window does not open on Linux.** Start it with `run-gui.sh`, not
-   `sudo hamradnet-gui`.
+6. **The app window does not open on Linux (standalone version).** Start it
+   with `run-gui.sh`, not `sudo hamradnet-gui`.
+7. **The app says it needs administrator rights, or that the HamRadNet service
+   is not answering (service version).** The service is not running. See why
+   with `systemctl status hamradnet` and `journalctl -u hamradnet -n 50`, then
+   start it with `sudo systemctl start hamradnet`. If it was uninstalled, run
+   `sudo ./install.sh` again.
 
 ## Where things are
 
@@ -356,6 +361,16 @@ Then go down this list in order:
 
 The Go and Rust apps share these files, so you can switch apps and keep your
 networks.
+
+With the Linux service installed:
+
+| What | Where |
+|---|---|
+| Is it running? | `systemctl status hamradnet` |
+| Its log | `hamradnet logs` (or **Log** in the app), or `journalctl -u hamradnet -f` |
+| The programs | `/usr/local/bin/hamradnet`, `hamradnet-gui`, `hamradnet-uninstall` |
+| The service file | `/etc/systemd/system/hamradnet.service` |
+| The menu entries | `/usr/local/share/applications/hamradnet.desktop` and `hamradnet-uninstall.desktop` |
 
 On the server:
 
